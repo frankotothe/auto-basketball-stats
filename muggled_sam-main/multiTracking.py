@@ -515,7 +515,7 @@ def main():
         # Save JSON data
         os.makedirs(os.path.dirname(tracking_json_path), exist_ok=True)
         with open(tracking_json_path, 'w') as f:
-        json.dump(tracking_data, f)
+            json.dump(tracking_data, f)
         print(f"Original video saved to: {output_original}")
         print(f"Mask video saved to: {output_masks}")
         print(f"Labels video saved to: {output_labels}")
