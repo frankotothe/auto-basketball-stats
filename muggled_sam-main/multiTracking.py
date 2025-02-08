@@ -1,5 +1,5 @@
 from collections import defaultdict
-import csv
+import json
 import os
 import cv2
 import numpy as np
@@ -11,7 +11,7 @@ from ultralytics import YOLO
 # Constants
 MAX_FRAMES_TO_CHECK = 250
 CONFIDENCE_THRESHOLD = 0.6
-LOST_FRAMES_THRESHOLD = 3
+LOST_FRAMES_THRESHOLD = 10
 BALL_CONFIDENCE_THRESHOLD = 0.5
 PLAYER_CONFIDENCE_THRESHOLD = 0.65
 CENTROID_DISTANCE_THRESHOLD = 30  # Maximum distance in pixels between centroids
@@ -95,33 +95,23 @@ class ReintroductionTracker:
             return True, valid_detections[-1]
         return False, None
 
-def log_object_tracking(trackers, frame_idx, output_csv_path):
-    """Log object tracking information to a CSV file"""
-    # Ensure the directory exists
-    os.makedirs(os.path.dirname(output_csv_path), exist_ok=True)
+def log_object_tracking(trackers, frame_idx, json_data):
+    """Log object tracking information to a JSON structure"""
+    frame_key = f"frame_{frame_idx}"
+    json_data[frame_key] = {}
     
-    # Open the file in append mode (or create if it doesn't exist)
-    with open(output_csv_path, 'a', newline='') as csvfile:
-        csv_writer = csv.writer(csvfile)
-        
-        # Write header if file is empty
-        if csvfile.tell() == 0:
-            csv_writer.writerow([
-                'frame', 'object_id', 'object_type', 'is_active', 
-                'centroid_x', 'centroid_y', 'mask_area'
-            ])
-        
-        # Write tracking information for each object
-        for obj_key, tracker in trackers.items():
-            csv_writer.writerow([
-                frame_idx, 
-                tracker.unique_id, 
-                obj_key, 
-                tracker.is_active,
-                tracker.last_centroid[0] if tracker.last_centroid else None,  # x coordinate
-                tracker.last_centroid[1] if tracker.last_centroid else None,  # y coordinate
-                tracker.mask_area
-            ])
+    for obj_key, tracker in trackers.items():
+        if tracker.is_active and tracker.last_mask is not None:
+            # Get coordinates where mask is True
+            y_coords, x_coords = np.where(tracker.last_mask)
+            if len(x_coords) > 0:  # Only add if mask has True pixels
+                json_data[frame_key][f"{obj_key}_{tracker.unique_id}"] = {
+                    "type": obj_key,
+                    "coords": {
+                        "x": x_coords.tolist(),
+                        "y": y_coords.tolist()
+                    }
+                }
 
 def calculate_mask_iou(mask1, mask2):
     """Calculate Intersection over Union between two masks"""
@@ -265,8 +255,9 @@ def main():
     output_original = "output_original.mp4"
     output_masks = "output_masks.mp4"
     output_labels = "output_labels.mp4"
-    tracking_log_path = "tracking_logs/object_tracking.csv"
-    
+    tracking_json_path = "tracking_logs/object_tracking.json"
+    tracking_data = {}
+
     device, dtype = "cpu", torch.float32
     if torch.cuda.is_available():
         device, dtype = "cuda", torch.bfloat16
@@ -477,7 +468,7 @@ def main():
                         trackers[obj_key].is_active = False
             
             # Log object tracking information
-            log_object_tracking(trackers, frame_idx, tracking_log_path)
+            log_object_tracking(trackers, frame_idx, tracking_data)
             
             # Create visualization frame - Modified to ensure ball is always on top
             vis_mask = np.zeros((*frame.shape[0:2], 3), dtype=np.uint8)
@@ -520,10 +511,15 @@ def main():
         out_original.release()
         out_masks.release()
         out_labels.release()
+
+        # Save JSON data
+        os.makedirs(os.path.dirname(tracking_json_path), exist_ok=True)
+        with open(tracking_json_path, 'w') as f:
+        json.dump(tracking_data, f)
         print(f"Original video saved to: {output_original}")
         print(f"Mask video saved to: {output_masks}")
         print(f"Labels video saved to: {output_labels}")
-        print(f"Tracking logs saved to: {tracking_log_path}")
+        print(f"Tracking data saved to: {tracking_json_path}")
 
 if __name__ == "__main__":
     main()
