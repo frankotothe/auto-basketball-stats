@@ -249,6 +249,62 @@ def find_initialization_frame(video_path, yolo_model):
         print(f"Initialization failed: {str(e)}")
         raise
 
+def encode_mask_rle(mask):
+    """
+    Convert a binary mask to Run Length Encoding (RLE).
+    Returns: List of (start_pos, run_length) tuples and mask shape
+    """
+    # Flatten mask
+    mask_flat = mask.flatten()
+    # Find positions where values change
+    diff = np.diff(np.concatenate(([0], mask_flat, [0])))
+    runs_start = np.where(diff == 1)[0]
+    runs_end = np.where(diff == -1)[0]
+    
+    # Create RLE encoding
+    run_lengths = runs_end - runs_start
+    rle = list(zip(runs_start, run_lengths))
+    return rle, mask.shape
+
+
+def compress_mask(mask, scale_factor=4):
+    """
+    Downsample mask by given scale factor using max pooling
+    """
+    h, w = mask.shape
+    new_h, new_w = h // scale_factor, w // scale_factor
+    mask_reshaped = mask.reshape(new_h, scale_factor, new_w, scale_factor)
+    return mask_reshaped.any(axis=(1,3))
+
+
+# Replace your log_object_tracking function with this version
+def log_object_tracking(trackers, frame_idx, h5_file):
+    """Log tracking data using RLE compression"""
+    frame_group = h5_file.create_group(f"frame_{frame_idx:05d}")
+    
+    for obj_key, tracker in trackers.items():
+        if tracker.is_active and tracker.last_mask is not None:
+            # Create object group
+            obj_group = frame_group.create_group(obj_key)
+            
+            # Store downsampled RLE mask
+            downsampled_mask = compress_mask(tracker.last_mask, scale_factor=4)
+            rle, shape = encode_mask_rle(downsampled_mask)
+            
+            # Store RLE data efficiently
+            if rle:  # Only store if mask is not empty
+                starts, lengths = zip(*rle)
+                rle_data = np.array(list(zip(starts, lengths)), dtype=np.uint32)
+                obj_group.create_dataset('mask_rle', data=rle_data, 
+                                       compression="gzip", compression_opts=9)
+                obj_group.create_dataset('mask_shape', data=np.array(shape))
+            
+            # Store metadata
+            obj_group.attrs['object_id'] = tracker.unique_id
+            if tracker.last_centroid is not None:
+                obj_group.attrs['centroid_x'] = tracker.last_centroid[0]
+                obj_group.attrs['centroid_y'] = tracker.last_centroid[1]
+
 
 def main():
     # Define pathing & device usage
@@ -262,7 +318,7 @@ def main():
     output_labels = "output_labels.mp4"
     tracking_h5_path = "tracking_logs/object_tracking.h5"
     tracking_data = {}
-
+    MASK_DOWNSAMPLE_FACTOR = 4  # Adjust based on your needs
     device, dtype = "cpu", torch.float32
     if torch.cuda.is_available():
         device, dtype = "cuda", torch.bfloat16
@@ -326,6 +382,10 @@ def main():
         os.makedirs(os.path.dirname(tracking_h5_path), exist_ok=True)
         with h5py.File(tracking_h5_path, 'w') as h5_file:
             total_frames = int(vcap.get(cv2.CAP_PROP_FRAME_COUNT))
+            h5_file.attrs['mask_downsample_factor'] = MASK_DOWNSAMPLE_FACTOR
+            h5_file.attrs['video_width'] = frame_width
+            h5_file.attrs['video_height'] = frame_height
+            h5_file.attrs['fps'] = fps
             for frame_idx in range(total_frames):
                 if frame_idx % 100 == 0:
                     print(f"Processing frame {frame_idx}/{total_frames}")
