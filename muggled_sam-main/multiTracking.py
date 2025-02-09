@@ -96,25 +96,27 @@ class ReintroductionTracker:
         return False, None
 
 def log_object_tracking(trackers, frame_idx, h5_file):
-    """Log object tracking information to HDF5 file format"""
-    frame_group = h5_file.create_group(f"frame_{frame_idx}")
+    """Log tracking data in an efficient HDF5 format"""
+    frame_group = h5_file.create_group(f"frame_{frame_idx:05d}")  # Zero-padded frame numbers
     
     for obj_key, tracker in trackers.items():
         if tracker.is_active and tracker.last_mask is not None:
-            # Get coordinates where mask is True
             y_coords, x_coords = np.where(tracker.last_mask)
-            if len(x_coords) > 0:  # Only add if mask has True pixels
-                # Create object group and store coordinates
-                obj_group = frame_group.create_group(f"{obj_key}_{tracker.unique_id}")
-                coords_dataset = obj_group.create_dataset(
-                    "coords",
+            if len(x_coords) > 0:
+                # Store coordinates in a compressed dataset
+                obj_dataset = frame_group.create_dataset(
+                    f"{obj_key}",  # e.g., "ball" or "player_1"
                     data=np.column_stack((x_coords, y_coords)),
-                    dtype=np.int64
+                    dtype=np.uint16,
+                    compression="gzip",
+                    compression_opts=9
                 )
                 
-                # Optionally store metadata
-                obj_group.attrs['type'] = obj_key
-
+                # Store metadata as attributes
+                obj_dataset.attrs['object_id'] = tracker.unique_id
+                if tracker.last_centroid is not None:
+                    obj_dataset.attrs['centroid_x'] = tracker.last_centroid[0]
+                    obj_dataset.attrs['centroid_y'] = tracker.last_centroid[1]
 
 def calculate_mask_iou(mask1, mask2):
     """Calculate Intersection over Union between two masks"""
@@ -250,8 +252,8 @@ def find_initialization_frame(video_path, yolo_model):
 
 def main():
     # Define pathing & device usage
-    video_path = "../TestClip.mp4"
-    model_path = "model_weights/sam2.1_hiera_large.pt"
+    video_path = "../TestClip2.mp4"
+    model_path = "model_weights/large_custom_sam2.pt"
     yolo_model_path = "model_weights/v11.pt"
     
     # Updated output paths for separate videos
@@ -320,6 +322,8 @@ def main():
     vcap.set(cv2.CAP_PROP_POS_FRAMES, 0)
     
     try:
+        # Add this before the h5py.File() line
+        os.makedirs(os.path.dirname(tracking_h5_path), exist_ok=True)
         with h5py.File(tracking_h5_path, 'w') as h5_file:
             total_frames = int(vcap.get(cv2.CAP_PROP_FRAME_COUNT))
             for frame_idx in range(total_frames):
@@ -518,7 +522,7 @@ def main():
         print(f"Original video saved to: {output_original}")
         print(f"Mask video saved to: {output_masks}")
         print(f"Labels video saved to: {output_labels}")
-        print(f"Tracking data saved to: {tracking_json_path}")
+        print(f"Tracking data saved to: {tracking_h5_path}")
 
 if __name__ == "__main__":
     main()
