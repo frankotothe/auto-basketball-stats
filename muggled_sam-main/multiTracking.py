@@ -1,5 +1,5 @@
 from collections import defaultdict
-import json
+import h5py
 import os
 import cv2
 import numpy as np
@@ -95,23 +95,26 @@ class ReintroductionTracker:
             return True, valid_detections[-1]
         return False, None
 
-def log_object_tracking(trackers, frame_idx, json_data):
-    """Log object tracking information to a JSON structure"""
-    frame_key = f"frame_{frame_idx}"
-    json_data[frame_key] = {}
+def log_object_tracking(trackers, frame_idx, h5_file):
+    """Log object tracking information to HDF5 file format"""
+    frame_group = h5_file.create_group(f"frame_{frame_idx}")
     
     for obj_key, tracker in trackers.items():
         if tracker.is_active and tracker.last_mask is not None:
             # Get coordinates where mask is True
             y_coords, x_coords = np.where(tracker.last_mask)
             if len(x_coords) > 0:  # Only add if mask has True pixels
-                json_data[frame_key][f"{obj_key}_{tracker.unique_id}"] = {
-                    "type": obj_key,
-                    "coords": {
-                        "x": x_coords.tolist(),
-                        "y": y_coords.tolist()
-                    }
-                }
+                # Create object group and store coordinates
+                obj_group = frame_group.create_group(f"{obj_key}_{tracker.unique_id}")
+                coords_dataset = obj_group.create_dataset(
+                    "coords",
+                    data=np.column_stack((x_coords, y_coords)),
+                    dtype=np.int64
+                )
+                
+                # Optionally store metadata
+                obj_group.attrs['type'] = obj_key
+
 
 def calculate_mask_iou(mask1, mask2):
     """Calculate Intersection over Union between two masks"""
@@ -255,7 +258,7 @@ def main():
     output_original = "output_original.mp4"
     output_masks = "output_masks.mp4"
     output_labels = "output_labels.mp4"
-    tracking_json_path = "tracking_logs/object_tracking.json"
+    tracking_h5_path = "tracking_logs/object_tracking.h5"
     tracking_data = {}
 
     device, dtype = "cpu", torch.float32
@@ -317,205 +320,201 @@ def main():
     vcap.set(cv2.CAP_PROP_POS_FRAMES, 0)
     
     try:
-        total_frames = int(vcap.get(cv2.CAP_PROP_FRAME_COUNT))
-        for frame_idx in range(total_frames):
-            if frame_idx % 100 == 0:
-                print(f"Processing frame {frame_idx}/{total_frames}")
+        with h5py.File(tracking_h5_path, 'w') as h5_file:
+            total_frames = int(vcap.get(cv2.CAP_PROP_FRAME_COUNT))
+            for frame_idx in range(total_frames):
+                if frame_idx % 100 == 0:
+                    print(f"Processing frame {frame_idx}/{total_frames}")
+                    
+                ok_frame, frame = vcap.read()
+                if not ok_frame:
+                    break
                 
-            ok_frame, frame = vcap.read()
-            if not ok_frame:
-                break
-            
-            # Get current detections
-            detected_players, detected_ball, detected_rim = find_objects_in_frame(frame, yolo_model)
-            
-            # Handle rim detection and tracking
-            if "rim" not in trackers and detected_rim is not None:
-                rim_reintroduction.add_detection(detected_rim)
-                should_reintroduce, rim_data = rim_reintroduction.should_reintroduce()
+                # Get current detections
+                detected_players, detected_ball, detected_rim = find_objects_in_frame(frame, yolo_model)
                 
-                if should_reintroduce:
-                    print(f"Introducing rim tracking at frame {frame_idx}")
-                    trackers["rim"] = ObjectTracker("rim", unique_id_counter)
-                    unique_id_counter += 1
-                    if frame_idx not in prompts_per_frame_index:
-                        prompts_per_frame_index[frame_idx] = {}
-                    prompts_per_frame_index[frame_idx]["rim"] = rim_data
-            
-            # Update lost frames counters and handle reintroductions
-            for obj_key, tracker in list(trackers.items()):
-                if not tracker.is_active:
-                    lost_frames_counters[obj_key] += 1
-                else:
-                    lost_frames_counters[obj_key] = 0
-                
-                # Handle reintroduction logic
-                if lost_frames_counters[obj_key] > 3:
-                    if obj_key == "ball":
-                        ball_reintroduction.add_detection(detected_ball)
-                        should_reintroduce, obj_data = ball_reintroduction.should_reintroduce()
-                    elif obj_key == "rim":
-                        rim_reintroduction.add_detection(detected_rim)
-                        should_reintroduce, obj_data = rim_reintroduction.should_reintroduce()
-                    else:  # Player
-                        if obj_key not in player_reintroduction_trackers:
-                            player_reintroduction_trackers[obj_key] = ReintroductionTracker(PLAYER_CONFIDENCE_THRESHOLD)
-                        
-                        # Find nearest detected player to last known position
-                        if detected_players:
-                            non_overlapping_players = [
-                                p for p in detected_players 
-                                if not is_detection_overlapping(p, trackers)
-                            ]
-                            
-                            if non_overlapping_players:
-                                best_player = non_overlapping_players[0]
-                                player_reintroduction_trackers[obj_key].add_detection(best_player)
-                            else:
-                                player_reintroduction_trackers[obj_key].add_detection(None)
-                        else:
-                            player_reintroduction_trackers[obj_key].add_detection(None)
-                        
-                        should_reintroduce, obj_data = player_reintroduction_trackers[obj_key].should_reintroduce()
+                # Handle rim detection and tracking
+                if "rim" not in trackers and detected_rim is not None:
+                    rim_reintroduction.add_detection(detected_rim)
+                    should_reintroduce, rim_data = rim_reintroduction.should_reintroduce()
                     
                     if should_reintroduce:
-                        print(f"Reintroducing {obj_key} at frame {frame_idx}")
-                        trackers[obj_key] = ObjectTracker(obj_key, unique_id_counter)
+                        print(f"Introducing rim tracking at frame {frame_idx}")
+                        trackers["rim"] = ObjectTracker("rim", unique_id_counter)
                         unique_id_counter += 1
                         if frame_idx not in prompts_per_frame_index:
                             prompts_per_frame_index[frame_idx] = {}
-                        prompts_per_frame_index[frame_idx][obj_key] = obj_data
+                        prompts_per_frame_index[frame_idx]["rim"] = rim_data
+                
+                # Update lost frames counters and handle reintroductions
+                for obj_key, tracker in list(trackers.items()):
+                    if not tracker.is_active:
+                        lost_frames_counters[obj_key] += 1
+                    else:
                         lost_frames_counters[obj_key] = 0
-                        if obj_key == "ball":
-                            ball_reintroduction = ReintroductionTracker(BALL_CONFIDENCE_THRESHOLD)
-                        elif obj_key == "rim":
-                            rim_reintroduction = ReintroductionTracker(RIM_CONFIDENCE_THRESHOLD)
-                            rim_reintroduction.required_consecutive_frames = RIM_REINTRODUCTION_FRAMES
-                        else:
-                            player_reintroduction_trackers[obj_key] = ReintroductionTracker(PLAYER_CONFIDENCE_THRESHOLD)
-            
-            # Encode frame data
-            encoded_imgs_list, _, _ = sammodel.encode_image(
-                frame,
-                max_side_length=1024,
-                use_square_sizing=True
-            )
-            
-            # Handle initialization or reintroduction frame
-            if frame_idx in prompts_per_frame_index:
-                for obj_key, obj_prompts in prompts_per_frame_index[frame_idx].items():
-                    print(f"Initializing tracking for {obj_key}")
-                    init_mask, init_mem, init_ptr = sammodel.initialize_video_masking(
-                        encoded_imgs_list, 
-                        box_tlbr_norm_list=obj_prompts['box_tlbr_norm_list'],
-                        fg_xy_norm_list=obj_prompts['fg_xy_norm_list'],
-                        bg_xy_norm_list=obj_prompts['bg_xy_norm_list']
-                    )
-                    memory_per_obj_dict[obj_key].store_prompt_result(frame_idx, init_mem, init_ptr)
-            
-            # Track objects
-            combined_mask_result = np.zeros(frame.shape[0:2], dtype=bool)
-            player_mask_result = np.zeros(frame.shape[0:2], dtype=bool)
-            ball_mask_result = np.zeros(frame.shape[0:2], dtype=bool)
-            rim_mask_result = np.zeros(frame.shape[0:2], dtype=bool)
-            
-            # First pass: generate all masks and update tracker information
-            active_objects = []
-            for obj_key, tracker in trackers.items():
-                if not tracker.is_active:
-                    continue
                     
-                obj_memory = memory_per_obj_dict[obj_key]
-                obj_score, best_mask_idx, mask_preds, mem_enc, obj_ptr = sammodel.step_video_masking(
-                    encoded_imgs_list, **obj_memory.to_dict()
+                    # Handle reintroduction logic
+                    if lost_frames_counters[obj_key] > 3:
+                        if obj_key == "ball":
+                            ball_reintroduction.add_detection(detected_ball)
+                            should_reintroduce, obj_data = ball_reintroduction.should_reintroduce()
+                        elif obj_key == "rim":
+                            rim_reintroduction.add_detection(detected_rim)
+                            should_reintroduce, obj_data = rim_reintroduction.should_reintroduce()
+                        else:  # Player
+                            if obj_key not in player_reintroduction_trackers:
+                                player_reintroduction_trackers[obj_key] = ReintroductionTracker(PLAYER_CONFIDENCE_THRESHOLD)
+                            
+                            # Find nearest detected player to last known position
+                            if detected_players:
+                                non_overlapping_players = [
+                                    p for p in detected_players 
+                                    if not is_detection_overlapping(p, trackers)
+                                ]
+                                
+                                if non_overlapping_players:
+                                    best_player = non_overlapping_players[0]
+                                    player_reintroduction_trackers[obj_key].add_detection(best_player)
+                                else:
+                                    player_reintroduction_trackers[obj_key].add_detection(None)
+                            else:
+                                player_reintroduction_trackers[obj_key].add_detection(None)
+                            
+                            should_reintroduce, obj_data = player_reintroduction_trackers[obj_key].should_reintroduce()
+                        
+                        if should_reintroduce:
+                            print(f"Reintroducing {obj_key} at frame {frame_idx}")
+                            trackers[obj_key] = ObjectTracker(obj_key, unique_id_counter)
+                            unique_id_counter += 1
+                            if frame_idx not in prompts_per_frame_index:
+                                prompts_per_frame_index[frame_idx] = {}
+                            prompts_per_frame_index[frame_idx][obj_key] = obj_data
+                            lost_frames_counters[obj_key] = 0
+                            if obj_key == "ball":
+                                ball_reintroduction = ReintroductionTracker(BALL_CONFIDENCE_THRESHOLD)
+                            elif obj_key == "rim":
+                                rim_reintroduction = ReintroductionTracker(RIM_CONFIDENCE_THRESHOLD)
+                                rim_reintroduction.required_consecutive_frames = RIM_REINTRODUCTION_FRAMES
+                            else:
+                                player_reintroduction_trackers[obj_key] = ReintroductionTracker(PLAYER_CONFIDENCE_THRESHOLD)
+                
+                # Encode frame data
+                encoded_imgs_list, _, _ = sammodel.encode_image(
+                    frame,
+                    max_side_length=1024,
+                    use_square_sizing=True
                 )
                 
-                # Update tracker status
-                tracker.update_score(obj_score.item())
-                if not tracker.is_active:
-                    print(f"Removing {obj_key} due to consecutive low scores")
-                    continue
+                # Handle initialization or reintroduction frame
+                if frame_idx in prompts_per_frame_index:
+                    for obj_key, obj_prompts in prompts_per_frame_index[frame_idx].items():
+                        print(f"Initializing tracking for {obj_key}")
+                        init_mask, init_mem, init_ptr = sammodel.initialize_video_masking(
+                            encoded_imgs_list, 
+                            box_tlbr_norm_list=obj_prompts['box_tlbr_norm_list'],
+                            fg_xy_norm_list=obj_prompts['fg_xy_norm_list'],
+                            bg_xy_norm_list=obj_prompts['bg_xy_norm_list']
+                        )
+                        memory_per_obj_dict[obj_key].store_prompt_result(frame_idx, init_mem, init_ptr)
                 
-                # Store memory
-                obj_memory.store_result(frame_idx, mem_enc, obj_ptr)
-                active_objects.append(obj_key)
+                # Track objects
+                combined_mask_result = np.zeros(frame.shape[0:2], dtype=bool)
+                player_mask_result = np.zeros(frame.shape[0:2], dtype=bool)
+                ball_mask_result = np.zeros(frame.shape[0:2], dtype=bool)
+                rim_mask_result = np.zeros(frame.shape[0:2], dtype=bool)
                 
-                # Create mask and update tracker information
-                obj_mask = torch.nn.functional.interpolate(
-                    mask_preds[:, best_mask_idx, :, :],
-                    size=combined_mask_result.shape,
-                    mode="bilinear",
-                    align_corners=False,
-                )
-                obj_mask_binary = (obj_mask > 0.0).cpu().numpy().squeeze()
-                tracker.update_mask_and_centroid(obj_mask_binary)
+                # First pass: generate all masks and update tracker information
+                active_objects = []
+                for obj_key, tracker in trackers.items():
+                    if not tracker.is_active:
+                        continue
+                        
+                    obj_memory = memory_per_obj_dict[obj_key]
+                    obj_score, best_mask_idx, mask_preds, mem_enc, obj_ptr = sammodel.step_video_masking(
+                        encoded_imgs_list, **obj_memory.to_dict()
+                    )
+                    
+                    # Update tracker status
+                    tracker.update_score(obj_score.item())
+                    if not tracker.is_active:
+                        print(f"Removing {obj_key} due to consecutive low scores")
+                        continue
+                    
+                    # Store memory
+                    obj_memory.store_result(frame_idx, mem_enc, obj_ptr)
+                    active_objects.append(obj_key)
+                    
+                    # Create mask and update tracker information
+                    obj_mask = torch.nn.functional.interpolate(
+                        mask_preds[:, best_mask_idx, :, :],
+                        size=combined_mask_result.shape,
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                    obj_mask_binary = (obj_mask > 0.0).cpu().numpy().squeeze()
+                    tracker.update_mask_and_centroid(obj_mask_binary)
+                    
+                    # Update visualization masks
+                    if obj_key == "ball":
+                        ball_mask_result = np.bitwise_or(ball_mask_result, obj_mask_binary)
+                    elif obj_key == "rim":
+                        rim_mask_result = np.bitwise_or(rim_mask_result, obj_mask_binary)
+                    else:
+                        player_mask_result = np.bitwise_or(player_mask_result, obj_mask_binary)
+                    combined_mask_result = np.bitwise_or(combined_mask_result, obj_mask_binary)
                 
-                # Update visualization masks
-                if obj_key == "ball":
-                    ball_mask_result = np.bitwise_or(ball_mask_result, obj_mask_binary)
-                elif obj_key == "rim":
-                    rim_mask_result = np.bitwise_or(rim_mask_result, obj_mask_binary)
-                else:
-                    player_mask_result = np.bitwise_or(player_mask_result, obj_mask_binary)
-                combined_mask_result = np.bitwise_or(combined_mask_result, obj_mask_binary)
-            
-            # Check for overlapping players and handle removal
-            if frame_idx > 0:  # Skip first frame to allow initialization
-                to_remove = check_for_overlaps(trackers)
-                for obj_key in to_remove:
-                    if trackers[obj_key].is_active:
-                        print(f"Removing {obj_key} due to overlap at frame {frame_idx}")
-                        trackers[obj_key].is_active = False
-            
-            # Log object tracking information
-            log_object_tracking(trackers, frame_idx, tracking_data)
-            
-            # Create visualization frame - Modified to ensure ball is always on top
-            vis_mask = np.zeros((*frame.shape[0:2], 3), dtype=np.uint8)
-            
-            # Layer the masks in specific order: rim -> players -> ball
-            vis_mask[rim_mask_result] = [0, 255, 0]         # Green for rim (bottom layer)
-            vis_mask[player_mask_result] = [255, 255, 255]  # White for players (middle layer)
-            vis_mask[ball_mask_result] = [0, 165, 255]      # Orange for ball (top layer)
-            
-            # Create info frame with object IDs and tracking details
-            info_frame = np.zeros((frame.shape[0], frame.shape[1], 3), dtype=np.uint8)
-            
-            # Add tracking labels
-            for obj_key, tracker in trackers.items():
-                if tracker.is_active and tracker.last_centroid is not None:
-                    label = f"{obj_key}-{tracker.unique_id}"
-                    cv2.putText(info_frame, 
-                              label, 
-                              (int(tracker.last_centroid[0]), int(tracker.last_centroid[1])), 
-                              cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            
-            # Add status information to info frame
-            active_players = len([k for k in active_objects if k not in ["ball", "rim"]])
-            cv2.putText(info_frame, f"Frame: {frame_idx}", (10, 30), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            cv2.putText(info_frame, f"Active Players: {active_players}", 
-                       (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            cv2.putText(info_frame, f"Ball Status: {'Active' if 'ball' in active_objects else 'Lost'}", 
-                       (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            cv2.putText(info_frame, f"Rim Status: {'Active' if 'rim' in active_objects else 'Lost'}", 
-                       (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-            
-            # Write frames to respective output videos
-            out_original.write(frame)
-            out_masks.write(vis_mask)
-            out_labels.write(info_frame)
+                # Check for overlapping players and handle removal
+                if frame_idx > 0:  # Skip first frame to allow initialization
+                    to_remove = check_for_overlaps(trackers)
+                    for obj_key in to_remove:
+                        if trackers[obj_key].is_active:
+                            print(f"Removing {obj_key} due to overlap at frame {frame_idx}")
+                            trackers[obj_key].is_active = False
                 
+                # Log object tracking information
+                log_object_tracking(trackers, frame_idx, h5_file)
+                
+                # Create visualization frame - Modified to ensure ball is always on top
+                vis_mask = np.zeros((*frame.shape[0:2], 3), dtype=np.uint8)
+                
+                # Layer the masks in specific order: rim -> players -> ball
+                vis_mask[rim_mask_result] = [0, 255, 0]         # Green for rim (bottom layer)
+                vis_mask[player_mask_result] = [255, 255, 255]  # White for players (middle layer)
+                vis_mask[ball_mask_result] = [0, 165, 255]      # Orange for ball (top layer)
+                
+                # Create info frame with object IDs and tracking details
+                info_frame = np.zeros((frame.shape[0], frame.shape[1], 3), dtype=np.uint8)
+                
+                # Add tracking labels
+                for obj_key, tracker in trackers.items():
+                    if tracker.is_active and tracker.last_centroid is not None:
+                        label = f"{obj_key}-{tracker.unique_id}"
+                        cv2.putText(info_frame, 
+                                label, 
+                                (int(tracker.last_centroid[0]), int(tracker.last_centroid[1])), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                
+                # Add status information to info frame
+                active_players = len([k for k in active_objects if k not in ["ball", "rim"]])
+                cv2.putText(info_frame, f"Frame: {frame_idx}", (10, 30), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                cv2.putText(info_frame, f"Active Players: {active_players}", 
+                        (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                cv2.putText(info_frame, f"Ball Status: {'Active' if 'ball' in active_objects else 'Lost'}", 
+                        (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                cv2.putText(info_frame, f"Rim Status: {'Active' if 'rim' in active_objects else 'Lost'}", 
+                        (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+                
+                # Write frames to respective output videos
+                out_original.write(frame)
+                out_masks.write(vis_mask)
+                out_labels.write(info_frame)
+                    
     finally:
         vcap.release()
         out_original.release()
         out_masks.release()
         out_labels.release()
-
-        # Save JSON data
-        os.makedirs(os.path.dirname(tracking_json_path), exist_ok=True)
-        with open(tracking_json_path, 'w') as f:
-            json.dump(tracking_data, f)
         print(f"Original video saved to: {output_original}")
         print(f"Mask video saved to: {output_masks}")
         print(f"Labels video saved to: {output_labels}")
