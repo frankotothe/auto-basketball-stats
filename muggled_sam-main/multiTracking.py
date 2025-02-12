@@ -159,7 +159,7 @@ def check_for_overlaps(trackers):
                 else:
                     to_remove.add(key2)
                     
-                    return to_remove
+        return to_remove
 
 def is_detection_overlapping(detection, active_trackers):
     """Check if a new detection overlaps with any existing tracked players"""
