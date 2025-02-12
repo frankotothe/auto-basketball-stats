@@ -154,14 +154,12 @@ def check_for_overlaps(trackers):
                 tracker1.overlap_count[key2] += 1
                 tracker2.overlap_count[key1] += 1
                 
-                if tracker1.overlap_count[key2] >= OVERLAP_FRAMES_THRESHOLD:
-                    # Remove the tracker with smaller mask area (likely partial detection)
-                    if tracker1.mask_area <= tracker2.mask_area:
-                        to_remove.add(key1)
-                    else:
-                        to_remove.add(key2)
-    
-    return to_remove
+                if tracker1.unique_id > tracker2.unique_id:
+                    to_remove.add(key1)
+                else:
+                    to_remove.add(key2)
+                    
+                    return to_remove
 
 def is_detection_overlapping(detection, active_trackers):
     """Check if a new detection overlaps with any existing tracked players"""
