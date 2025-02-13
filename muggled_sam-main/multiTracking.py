@@ -233,52 +233,69 @@ def check_for_overlaps(trackers):
     
     return to_remove
 
+
+def check_reintroduction_overlap(new_detection, active_trackers):
+    """
+    Check if a new detection would overlap with any existing tracked players.
+    Only used during reintroduction to prevent creating overlapping trackers.
+    """
+    if 'centroid' not in new_detection:
+        return True  # Consider invalid detections as overlapping
+        
+    detection_centroid = new_detection['centroid']
+    
+    for tracker in active_trackers.values():
+        if not tracker.is_active or tracker.last_centroid is None:
+            continue
+            
+        distance = calculate_centroid_distance(detection_centroid, tracker.last_centroid)
+        if distance < CENTROID_DISTANCE_THRESHOLD:
+            return True
+                
+    return False
+
 def handle_reintroductions(frame_idx, trackers, detected_players, prompts_per_frame_index, unique_id_counter):
-    """Handle reintroductions one at a time, matching lost trackers to available detections"""
+    """Handle reintroductions by properly matching detected players to lost trackers"""
     # Get lost trackers sorted by how long they've been lost
     lost_trackers = sorted(
         [(k, v) for k, v in trackers.items() if not v.is_active and k.startswith("player_")],
         key=lambda x: x[1].consecutive_low_scores
     )
     
-    # Get currently tracked positions
-    active_positions = [
-        tracker.last_centroid for tracker in trackers.values()
-        if tracker.is_active and tracker.last_centroid is not None
-    ]
+    if not lost_trackers or not detected_players:
+        return unique_id_counter, set()
     
-    # Filter out detections that are too close to existing tracked objects
-    available_detections = []
-    for detection in detected_players:
-        if 'centroid' not in detection:
-            continue
-            
-        is_far_enough = True
-        for active_pos in active_positions:
-            if calculate_centroid_distance(detection['centroid'], active_pos) < CENTROID_DISTANCE_THRESHOLD:
-                is_far_enough = False
-                break
-                
-        if is_far_enough:
-            available_detections.append(detection)
+    # Filter out detections that overlap with existing trackers
+    available_detections = [
+        detection for detection in detected_players
+        if detection['confidence'] > PLAYER_CONFIDENCE_THRESHOLD and
+        not check_reintroduction_overlap(detection, trackers)
+    ]
     
     # Match lost trackers to available detections
     reintroduced = set()
     for lost_key, lost_tracker in lost_trackers:
         if not available_detections:
             break
-            
-        # Find the best detection for this tracker
-        best_detection = available_detections.pop(0)  # Take the first available detection
         
+        best_detection = available_detections[0]
+        
+        # Create new tracker
         print(f"Reintroducing {lost_key} at frame {frame_idx}")
-        trackers[lost_key] = ObjectTracker(lost_key, unique_id_counter)
+        new_tracker = ObjectTracker(lost_key, unique_id_counter)
         unique_id_counter += 1
         
+        # Initialize frame prompts if needed
         if frame_idx not in prompts_per_frame_index:
             prompts_per_frame_index[frame_idx] = {}
+        
+        # Add detection to prompts and update tracker
         prompts_per_frame_index[frame_idx][lost_key] = best_detection
+        trackers[lost_key] = new_tracker
         reintroduced.add(lost_key)
+        
+        # Remove used detection
+        available_detections.pop(0)
     
     return unique_id_counter, reintroduced
 
@@ -427,7 +444,7 @@ def log_object_tracking(trackers, frame_idx, h5_file):
 
 def main():
     # Define pathing & device usage
-    video_path = "../TestClip2.mp4"
+    video_path = "../TestClip2lite.mp4"
     model_path = "model_weights/large_custom_sam2.pt"
     yolo_model_path = "model_weights/v11.pt"
     
