@@ -23,18 +23,18 @@ RIM_REINTRODUCTION_FRAMES = 5
 class ObjectTracker:
     def __init__(self, obj_key, unique_id):
         self.obj_key = obj_key
-        self.unique_id = unique_id  # Added unique identifier
+        self.unique_id = unique_id
         self.consecutive_low_scores = 0
         self.is_active = True
         self.last_centroid = None
         self.last_mask = None
         self.mask_area = 0
-        self.overlap_count = defaultdict(int)
-        self.invalid_ball_mask_count = 0  # New: counter for invalid ball masks
-        self.frame_width = None  # Will be set when first mask is processed
-        self.frame_height = None  # Will be set when first mask is processed
+        self.invalid_ball_mask_count = 0
+        self.frame_width = None
+        self.frame_height = None
 
     def update_score(self, score):
+        """Update tracker status based on score"""
         if score < 0:
             self.consecutive_low_scores += 1
         else:
@@ -45,7 +45,6 @@ class ObjectTracker:
             
     def update_mask_and_centroid(self, mask):
         """Update mask, centroid, and area information"""
-        self.last_mask = mask
         if mask is not None and mask.any():
             # Store frame dimensions if not set
             if self.frame_width is None:
@@ -64,17 +63,19 @@ class ObjectTracker:
                 x_movement = abs(new_centroid[0] - self.last_centroid[0])
                 y_movement = abs(new_centroid[1] - self.last_centroid[1])
                 
-                # Deactivate tracker if movement is too large
+                # Return early if movement is too large, without updating centroid or mask
                 if x_movement > max_x_movement or y_movement > max_y_movement:
                     print(f"Deactivating {self.obj_key} due to excessive movement: "
                           f"dx={x_movement:.1f}, dy={y_movement:.1f}")
                     self.is_active = False
                     return
 
+            # Only update if we haven't detected a jump
             self.last_centroid = new_centroid
+            self.last_mask = mask
             self.mask_area = len(x_indices)
 
-            # Ball-specific validation (unchanged)
+            # Ball-specific validation
             if self.obj_key == "ball":
                 height = max(y_indices) - min(y_indices)
                 width = max(x_indices) - min(x_indices)
@@ -95,8 +96,9 @@ class ObjectTracker:
                     self.is_active = False
         else:
             self.last_centroid = None
+            self.last_mask = None
             self.mask_area = 0
-            
+
 class ReintroductionTracker:
     def __init__(self, confidence_threshold):
         self.consecutive_detections = []
@@ -157,7 +159,7 @@ def calculate_centroid_distance(centroid1, centroid2):
     return np.sqrt((centroid1[0] - centroid2[0])**2 + (centroid1[1] - centroid2[1])**2)
 
 def check_for_overlaps(trackers):
-    """Check for overlapping player trackers using both mask IoU and centroid distance"""
+    """Check for overlapping player trackers and remove smaller masks"""
     to_remove = set()
     
     # If we have no trackers or only one tracker, return empty set
@@ -187,13 +189,14 @@ def check_for_overlaps(trackers):
             
             # Check if trackers are overlapping
             if (centroid_dist < CENTROID_DISTANCE_THRESHOLD and mask_iou > MASK_IOU_THRESHOLD):
-                # Always remove the newer tracker (higher unique_id)
-                if tracker1.unique_id > tracker2.unique_id:
+                # Remove the tracker with the smaller mask
+                if tracker1.mask_area < tracker2.mask_area:
                     to_remove.add(key1)
                 else:
                     to_remove.add(key2)
     
     return to_remove
+
 
 def is_detection_overlapping(detection, active_trackers):
     """Check if a new detection overlaps with any existing tracked players"""
@@ -530,7 +533,7 @@ def main():
                         encoded_imgs_list, **obj_memory.to_dict()
                     )
                     
-                    # Update tracker status
+                    # Update tracker status based on score
                     tracker.update_score(obj_score.item())
                     if not tracker.is_active:
                         print(f"Removing {obj_key} due to consecutive low scores")
@@ -538,7 +541,6 @@ def main():
                     
                     # Store memory
                     obj_memory.store_result(frame_idx, mem_enc, obj_ptr)
-                    active_objects.append(obj_key)
                     
                     # Create mask and update tracker information
                     obj_mask = torch.nn.functional.interpolate(
@@ -548,24 +550,30 @@ def main():
                         align_corners=False,
                     )
                     obj_mask_binary = (obj_mask > 0.0).cpu().numpy().squeeze()
+                    
+                    # Update mask and check for jumps - this will deactivate tracker if jump is too large
                     tracker.update_mask_and_centroid(obj_mask_binary)
                     
-                    # Update visualization masks
-                    if obj_key == "ball":
-                        ball_mask_result = np.bitwise_or(ball_mask_result, obj_mask_binary)
-                    elif obj_key == "rim":
-                        rim_mask_result = np.bitwise_or(rim_mask_result, obj_mask_binary)
-                    else:
-                        player_mask_result = np.bitwise_or(player_mask_result, obj_mask_binary)
-                    combined_mask_result = np.bitwise_or(combined_mask_result, obj_mask_binary)
+                    # Only add to active objects if still active after jump check
+                    if tracker.is_active:
+                        active_objects.append(obj_key)
+                        
+                        # Update visualization masks
+                        if obj_key == "ball":
+                            ball_mask_result = np.bitwise_or(ball_mask_result, obj_mask_binary)
+                        elif obj_key == "rim":
+                            rim_mask_result = np.bitwise_or(rim_mask_result, obj_mask_binary)
+                        else:
+                            player_mask_result = np.bitwise_or(player_mask_result, obj_mask_binary)
+                        combined_mask_result = np.bitwise_or(combined_mask_result, obj_mask_binary)
                 
-                # Check for overlapping players and handle removal
+                # Now check for overlaps and handle removal based on mask size
                 if frame_idx > 0:  # Skip first frame to allow initialization
                     to_remove = check_for_overlaps(trackers)
-                    if to_remove is not None:  # Add this safety check
+                    if to_remove:
                         for obj_key in to_remove:
                             if trackers[obj_key].is_active:
-                                print(f"Removing {obj_key} due to overlap at frame {frame_idx}")
+                                print(f"Removing {obj_key} due to having smaller mask in overlap")
                                 trackers[obj_key].is_active = False
                 
                 # Log object tracking information
