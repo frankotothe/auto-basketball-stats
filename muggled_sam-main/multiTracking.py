@@ -136,13 +136,25 @@ def check_for_overlaps(trackers):
     """Check for overlapping player trackers using both mask IoU and centroid distance"""
     to_remove = set()
     
+    # If we have no trackers or only one tracker, return empty set
+    if not trackers:
+        return to_remove
+        
     # Convert trackers dict to list of tuples for easier processing
     tracker_items = [(k, v) for k, v in trackers.items() if v.is_active and k != "ball"]
+    
+    # If we have less than 2 active trackers, no overlaps possible
+    if len(tracker_items) < 2:
+        return to_remove
     
     for i, (key1, tracker1) in enumerate(tracker_items):
         for key2, tracker2 in tracker_items[i+1:]:
             # Skip if either tracker is already marked for removal
             if key1 in to_remove or key2 in to_remove:
+                continue
+                
+            # Skip if either centroid is None
+            if tracker1.last_centroid is None or tracker2.last_centroid is None:
                 continue
                 
             # Calculate centroid distance and mask IoU
@@ -151,15 +163,13 @@ def check_for_overlaps(trackers):
             
             # Check if trackers are overlapping
             if (centroid_dist < CENTROID_DISTANCE_THRESHOLD and mask_iou > MASK_IOU_THRESHOLD):
-                tracker1.overlap_count[key2] += 1
-                tracker2.overlap_count[key1] += 1
-                
+                # Always remove the newer tracker (higher unique_id)
                 if tracker1.unique_id > tracker2.unique_id:
                     to_remove.add(key1)
                 else:
                     to_remove.add(key2)
-                    
-        return to_remove
+    
+    return to_remove
 
 def is_detection_overlapping(detection, active_trackers):
     """Check if a new detection overlaps with any existing tracked players"""
@@ -528,10 +538,11 @@ def main():
                 # Check for overlapping players and handle removal
                 if frame_idx > 0:  # Skip first frame to allow initialization
                     to_remove = check_for_overlaps(trackers)
-                    for obj_key in to_remove:
-                        if trackers[obj_key].is_active:
-                            print(f"Removing {obj_key} due to overlap at frame {frame_idx}")
-                            trackers[obj_key].is_active = False
+                    if to_remove is not None:  # Add this safety check
+                        for obj_key in to_remove:
+                            if trackers[obj_key].is_active:
+                                print(f"Removing {obj_key} due to overlap at frame {frame_idx}")
+                                trackers[obj_key].is_active = False
                 
                 # Log object tracking information
                 log_object_tracking(trackers, frame_idx, h5_file)
