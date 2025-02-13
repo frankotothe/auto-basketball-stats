@@ -31,6 +31,8 @@ class ObjectTracker:
         self.mask_area = 0
         self.overlap_count = defaultdict(int)
         self.invalid_ball_mask_count = 0  # New: counter for invalid ball masks
+        self.frame_width = None  # Will be set when first mask is processed
+        self.frame_height = None  # Will be set when first mask is processed
 
     def update_score(self, score):
         if score < 0:
@@ -45,17 +47,39 @@ class ObjectTracker:
         """Update mask, centroid, and area information"""
         self.last_mask = mask
         if mask is not None and mask.any():
+            # Store frame dimensions if not set
+            if self.frame_width is None:
+                self.frame_height, self.frame_width = mask.shape
+
             y_indices, x_indices = np.where(mask)
-            self.last_centroid = (np.mean(x_indices), np.mean(y_indices))
+            new_centroid = (np.mean(x_indices), np.mean(y_indices))
+            
+            # Check for large position changes for players only
+            if self.obj_key.startswith("player_") and self.last_centroid is not None:
+                # Calculate maximum allowed movement (15% of frame dimensions)
+                max_x_movement = self.frame_width * 0.15
+                max_y_movement = self.frame_height * 0.15
+                
+                # Calculate actual movement
+                x_movement = abs(new_centroid[0] - self.last_centroid[0])
+                y_movement = abs(new_centroid[1] - self.last_centroid[1])
+                
+                # Deactivate tracker if movement is too large
+                if x_movement > max_x_movement or y_movement > max_y_movement:
+                    print(f"Deactivating {self.obj_key} due to excessive movement: "
+                          f"dx={x_movement:.1f}, dy={y_movement:.1f}")
+                    self.is_active = False
+                    return
+
+            self.last_centroid = new_centroid
             self.mask_area = len(x_indices)
 
-            # Ball-specific validation
+            # Ball-specific validation (unchanged)
             if self.obj_key == "ball":
                 height = max(y_indices) - min(y_indices)
                 width = max(x_indices) - min(x_indices)
                 frame_height = mask.shape[0]
                 
-                # Check aspect ratio and relative height
                 aspect_ratio = max(width / height if height != 0 else float('inf'),
                                  height / width if width != 0 else float('inf'))
                 relative_height = height / frame_height
@@ -72,7 +96,7 @@ class ObjectTracker:
         else:
             self.last_centroid = None
             self.mask_area = 0
-
+            
 class ReintroductionTracker:
     def __init__(self, confidence_threshold):
         self.consecutive_detections = []
