@@ -11,7 +11,7 @@ from ultralytics import YOLO
 # Constants
 MAX_FRAMES_TO_CHECK = 250
 CONFIDENCE_THRESHOLD = 0.6
-LOST_FRAMES_THRESHOLD = 5
+LOST_FRAMES_THRESHOLD = 10
 BALL_CONFIDENCE_THRESHOLD = 0.5
 PLAYER_CONFIDENCE_THRESHOLD = 0.65
 CENTROID_DISTANCE_THRESHOLD = 30  # Maximum distance in pixels between centroids
@@ -32,7 +32,7 @@ class ObjectTracker:
         self.invalid_ball_mask_count = 0
         self.frame_width = None
         self.frame_height = None
-        # New attributes for history
+        # Add position history
         self.centroid_history = []
         self.max_history = 3
 
@@ -56,17 +56,30 @@ class ObjectTracker:
             y_indices, x_indices = np.where(mask)
             new_centroid = (np.mean(x_indices), np.mean(y_indices))
             
-            # Check for excessive movement before updating anything
-            if self.check_excessive_movement(new_centroid):
-                self.is_active = False
-                self.last_mask = None  # Don't save invalid mask
-                return False
-            
-            # Update centroid history
-            self.centroid_history.append(new_centroid)
-            if len(self.centroid_history) > self.max_history:
-                self.centroid_history.pop(0)
-            
+            # Check for large position changes for players only
+            if self.obj_key.startswith("player_") and self.last_centroid is not None:
+                # Calculate maximum allowed movement (15% of frame dimensions)
+                max_x_movement = self.frame_width * 0.15
+                max_y_movement = self.frame_height * 0.15
+                
+                # Calculate actual movement
+                x_movement = abs(new_centroid[0] - self.last_centroid[0])
+                y_movement = abs(new_centroid[1] - self.last_centroid[1])
+                
+                # Return early if movement is too large, without updating centroid or mask
+                if x_movement > max_x_movement or y_movement > max_y_movement:
+                    print(f"Deactivating {self.obj_key} due to excessive movement: "
+                          f"dx={x_movement:.1f}, dy={y_movement:.1f}")
+                    self.is_active = False
+                    return False  # Indicate invalid update
+
+            # Update centroid history before updating current centroid
+            if self.last_centroid is not None:
+                self.centroid_history.append(self.last_centroid)
+                if len(self.centroid_history) > self.max_history:
+                    self.centroid_history.pop(0)
+
+            # Only update if we haven't detected a jump
             self.last_centroid = new_centroid
             self.last_mask = mask
             self.mask_area = len(x_indices)
@@ -91,41 +104,14 @@ class ObjectTracker:
                           f"aspect ratio = {aspect_ratio:.2f}, relative height = {relative_height:.2f}")
                     self.is_active = False
                     return False
-            return True
+
+            return True  # Indicate valid update
         else:
             self.last_centroid = None
             self.last_mask = None
             self.mask_area = 0
             return False
 
-    def check_excessive_movement(self, new_centroid):
-        """Check if movement is excessive before updating position"""
-        if not self.obj_key.startswith("player_") or self.last_centroid is None:
-            return False
-
-        # Calculate maximum allowed movement (15% of frame dimensions)
-        max_x_movement = self.frame_width * 0.15
-        max_y_movement = self.frame_height * 0.15
-        
-        # Calculate actual movement
-        x_movement = abs(new_centroid[0] - self.last_centroid[0])
-        y_movement = abs(new_centroid[1] - self.last_centroid[1])
-        
-        if x_movement > max_x_movement or y_movement > max_y_movement:
-            print(f"Deactivating {self.obj_key} due to excessive movement: "
-                  f"dx={x_movement:.1f}, dy={y_movement:.1f}")
-            return True
-        return False
-
-    def get_centroid_consistency(self, centroid):
-        """Calculate how consistent a centroid is with recent history"""
-        if not self.centroid_history:
-            return float('inf')
-        
-        distances = [calculate_centroid_distance(c, centroid) 
-                    for c in self.centroid_history]
-        return sum(distances) / len(distances)
-    
 class ReintroductionTracker:
     def __init__(self, confidence_threshold):
         self.consecutive_detections = []
@@ -186,16 +172,11 @@ def calculate_centroid_distance(centroid1, centroid2):
     return np.sqrt((centroid1[0] - centroid2[0])**2 + (centroid1[1] - centroid2[1])**2)
 
 def check_for_overlaps(trackers):
-    """Check for overlapping player trackers and remove less consistent ones"""
+    """Check for overlapping player trackers and keep the one with more consistent trajectory"""
     to_remove = set()
     
-    # If we have no trackers or only one tracker, return empty set
-    if not trackers:
-        return to_remove
-        
     # Convert trackers dict to list of tuples for easier processing
-    tracker_items = [(k, v) for k, v in trackers.items() 
-                    if v.is_active and k != "ball" and v.last_mask is not None]
+    tracker_items = [(k, v) for k, v in trackers.items() if v.is_active and k != "ball"]
     
     # If we have less than 2 active trackers, no overlaps possible
     if len(tracker_items) < 2:
@@ -212,92 +193,75 @@ def check_for_overlaps(trackers):
                 continue
                 
             # Calculate centroid distance and mask IoU
-            centroid_dist = calculate_centroid_distance(tracker1.last_centroid, 
-                                                      tracker2.last_centroid)
+            centroid_dist = calculate_centroid_distance(tracker1.last_centroid, tracker2.last_centroid)
             mask_iou = calculate_mask_iou(tracker1.last_mask, tracker2.last_mask)
             
             # Check if trackers are overlapping
-            if (centroid_dist < CENTROID_DISTANCE_THRESHOLD and 
-                mask_iou > MASK_IOU_THRESHOLD):
-                # Calculate consistency scores
-                score1 = tracker1.get_centroid_consistency(tracker1.last_centroid)
-                score2 = tracker2.get_centroid_consistency(tracker2.last_centroid)
+            if (centroid_dist < CENTROID_DISTANCE_THRESHOLD and mask_iou > MASK_IOU_THRESHOLD):
+                # Calculate trajectory consistency
+                consistency1 = calculate_trajectory_consistency(tracker1)
+                consistency2 = calculate_trajectory_consistency(tracker2)
                 
-                # Remove the less consistent tracker
-                if score1 > score2:  # Higher score means less consistent
-                    print(f"Removing {key1} due to less consistent tracking in overlap")
+                # Remove the tracker with less consistent trajectory
+                if consistency1 < consistency2:
+                    print(f"Removing {key1} due to less consistent trajectory in overlap")
                     to_remove.add(key1)
                 else:
-                    print(f"Removing {key2} due to less consistent tracking in overlap")
+                    print(f"Removing {key2} due to less consistent trajectory in overlap")
                     to_remove.add(key2)
     
     return to_remove
 
-
-def check_reintroduction_overlap(new_detection, active_trackers):
-    """
-    Check if a new detection would overlap with any existing tracked players.
-    Only used during reintroduction to prevent creating overlapping trackers.
-    """
-    if 'centroid' not in new_detection:
-        return True  # Consider invalid detections as overlapping
-        
-    detection_centroid = new_detection['centroid']
+def calculate_trajectory_consistency(tracker):
+    """Calculate how consistent a tracker's movement has been"""
+    if len(tracker.centroid_history) < 2:
+        return 0.0
     
-    for tracker in active_trackers.values():
-        if not tracker.is_active or tracker.last_centroid is None:
-            continue
-            
-        distance = calculate_centroid_distance(detection_centroid, tracker.last_centroid)
-        if distance < CENTROID_DISTANCE_THRESHOLD:
-            return True
-                
-    return False
-
-def handle_reintroductions(frame_idx, trackers, detected_players, prompts_per_frame_index, unique_id_counter):
-    """Handle reintroductions by properly matching detected players to lost trackers"""
-    # Get lost trackers sorted by how long they've been lost
-    lost_trackers = sorted(
-        [(k, v) for k, v in trackers.items() if not v.is_active and k.startswith("player_")],
-        key=lambda x: x[1].consecutive_low_scores
-    )
+    # Calculate average movement vector from history
+    movements = []
+    for i in range(len(tracker.centroid_history) - 1):
+        dx = tracker.centroid_history[i+1][0] - tracker.centroid_history[i][0]
+        dy = tracker.centroid_history[i+1][1] - tracker.centroid_history[i][1]
+        movements.append((dx, dy))
     
-    if not lost_trackers or not detected_players:
-        return unique_id_counter, set()
+    # Calculate variance in movement
+    if not movements:
+        return 0.0
+    
+    avg_dx = sum(m[0] for m in movements) / len(movements)
+    avg_dy = sum(m[1] for m in movements) / len(movements)
+    
+    variance = sum((m[0] - avg_dx)**2 + (m[1] - avg_dy)**2 for m in movements)
+    
+    # Lower variance means more consistent movement
+    return 1.0 / (1.0 + variance)
+
+def process_reintroductions(missing_player_slots, detected_players, trackers, unique_id_counter):
+    """Process reintroductions ensuring one-to-one mapping between detections and slots"""
+    reintroductions = {}
     
     # Filter out detections that overlap with existing trackers
-    available_detections = [
-        detection for detection in detected_players
-        if detection['confidence'] > PLAYER_CONFIDENCE_THRESHOLD and
-        not check_reintroduction_overlap(detection, trackers)
+    valid_detections = [
+        p for p in detected_players 
+        if not is_detection_overlapping(p, trackers)
     ]
     
-    # Match lost trackers to available detections
-    reintroduced = set()
-    for lost_key, lost_tracker in lost_trackers:
-        if not available_detections:
-            break
-        
-        best_detection = available_detections[0]
-        
-        # Create new tracker
-        print(f"Reintroducing {lost_key} at frame {frame_idx}")
-        new_tracker = ObjectTracker(lost_key, unique_id_counter)
-        unique_id_counter += 1
-        
-        # Initialize frame prompts if needed
-        if frame_idx not in prompts_per_frame_index:
-            prompts_per_frame_index[frame_idx] = {}
-        
-        # Add detection to prompts and update tracker
-        prompts_per_frame_index[frame_idx][lost_key] = best_detection
-        trackers[lost_key] = new_tracker
-        reintroduced.add(lost_key)
-        
-        # Remove used detection
-        available_detections.pop(0)
+    # Map detections to empty slots one-to-one
+    for slot, detection in zip(missing_player_slots, valid_detections):
+        reintroductions[slot] = {
+            'detection': detection,
+            'unique_id': unique_id_counter + len(reintroductions)
+        }
     
-    return unique_id_counter, reintroduced
+    return reintroductions
+
+def get_missing_player_slots(trackers):
+    """Get list of empty player slots"""
+    expected_players = set(f"player_{i}" for i in range(10))
+    active_players = set(k for k, v in trackers.items() 
+                        if k.startswith("player_") and v.is_active)
+    return sorted(list(expected_players - active_players))
+
 
 def is_detection_overlapping(detection, active_trackers):
     """Check if a new detection overlaps with any existing tracked players"""
@@ -444,7 +408,7 @@ def log_object_tracking(trackers, frame_idx, h5_file):
 
 def main():
     # Define pathing & device usage
-    video_path = "../TestClip2lite.mp4"
+    video_path = "../TestClip2.mp4"
     model_path = "model_weights/large_custom_sam2.pt"
     yolo_model_path = "model_weights/v11.pt"
     
@@ -454,7 +418,7 @@ def main():
     output_labels = "output_labels.mp4"
     tracking_h5_path = "tracking_logs/object_tracking.h5"
     tracking_data = {}
-    MASK_DOWNSAMPLE_FACTOR = 4  # Adjust based on your needs
+    MASK_DOWNSAMPLE_FACTOR = 4
     device, dtype = "cpu", torch.float32
     if torch.cuda.is_available():
         device, dtype = "cuda", torch.bfloat16
@@ -494,8 +458,6 @@ def main():
     ball_reintroduction = ReintroductionTracker(BALL_CONFIDENCE_THRESHOLD)
     rim_reintroduction = ReintroductionTracker(RIM_CONFIDENCE_THRESHOLD)
     rim_reintroduction.required_consecutive_frames = RIM_REINTRODUCTION_FRAMES
-    player_reintroduction_trackers = {}
-    lost_frames_counters = defaultdict(int)
     
     # Process video
     vcap = cv2.VideoCapture(video_path)
@@ -514,7 +476,6 @@ def main():
     vcap.set(cv2.CAP_PROP_POS_FRAMES, 0)
     
     try:
-        # Add this before the h5py.File() line
         os.makedirs(os.path.dirname(tracking_h5_path), exist_ok=True)
         with h5py.File(tracking_h5_path, 'w') as h5_file:
             total_frames = int(vcap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -522,6 +483,7 @@ def main():
             h5_file.attrs['video_width'] = frame_width
             h5_file.attrs['video_height'] = frame_height
             h5_file.attrs['fps'] = fps
+            
             for frame_idx in range(total_frames):
                 if frame_idx % 100 == 0:
                     print(f"Processing frame {frame_idx}/{total_frames}")
@@ -546,57 +508,37 @@ def main():
                             prompts_per_frame_index[frame_idx] = {}
                         prompts_per_frame_index[frame_idx]["rim"] = rim_data
                 
-                # Update lost frames counters and handle reintroductions
-                for obj_key, tracker in list(trackers.items()):
-                    if not tracker.is_active:
-                        lost_frames_counters[obj_key] += 1
-                    else:
-                        lost_frames_counters[obj_key] = 0
+                # Check for lost ball and handle reintroduction
+                if "ball" not in trackers or not trackers["ball"].is_active:
+                    ball_reintroduction.add_detection(detected_ball)
+                    should_reintroduce, ball_data = ball_reintroduction.should_reintroduce()
                     
-                    # Handle reintroduction logic
-                    if lost_frames_counters[obj_key] > 3:
-                        if obj_key == "ball":
-                            ball_reintroduction.add_detection(detected_ball)
-                            should_reintroduce, obj_data = ball_reintroduction.should_reintroduce()
-                        elif obj_key == "rim":
-                            rim_reintroduction.add_detection(detected_rim)
-                            should_reintroduce, obj_data = rim_reintroduction.should_reintroduce()
-                        else:  # Player
-                            if obj_key not in player_reintroduction_trackers:
-                                player_reintroduction_trackers[obj_key] = ReintroductionTracker(PLAYER_CONFIDENCE_THRESHOLD)
-                            
-                            # Find nearest detected player to last known position
-                            if detected_players:
-                                non_overlapping_players = [
-                                    p for p in detected_players 
-                                    if not is_detection_overlapping(p, trackers)
-                                ]
-                                
-                                if non_overlapping_players:
-                                    best_player = non_overlapping_players[0]
-                                    player_reintroduction_trackers[obj_key].add_detection(best_player)
-                                else:
-                                    player_reintroduction_trackers[obj_key].add_detection(None)
-                            else:
-                                player_reintroduction_trackers[obj_key].add_detection(None)
-                            
-                            should_reintroduce, obj_data = player_reintroduction_trackers[obj_key].should_reintroduce()
-                        
-                        if should_reintroduce:
-                            print(f"Reintroducing {obj_key} at frame {frame_idx}")
-                            trackers[obj_key] = ObjectTracker(obj_key, unique_id_counter)
-                            unique_id_counter += 1
-                            if frame_idx not in prompts_per_frame_index:
-                                prompts_per_frame_index[frame_idx] = {}
-                            prompts_per_frame_index[frame_idx][obj_key] = obj_data
-                            lost_frames_counters[obj_key] = 0
-                            if obj_key == "ball":
-                                ball_reintroduction = ReintroductionTracker(BALL_CONFIDENCE_THRESHOLD)
-                            elif obj_key == "rim":
-                                rim_reintroduction = ReintroductionTracker(RIM_CONFIDENCE_THRESHOLD)
-                                rim_reintroduction.required_consecutive_frames = RIM_REINTRODUCTION_FRAMES
-                            else:
-                                player_reintroduction_trackers[obj_key] = ReintroductionTracker(PLAYER_CONFIDENCE_THRESHOLD)
+                    if should_reintroduce:
+                        print(f"Reintroducing ball at frame {frame_idx}")
+                        trackers["ball"] = ObjectTracker("ball", unique_id_counter)
+                        unique_id_counter += 1
+                        if frame_idx not in prompts_per_frame_index:
+                            prompts_per_frame_index[frame_idx] = {}
+                        prompts_per_frame_index[frame_idx]["ball"] = ball_data
+                        ball_reintroduction = ReintroductionTracker(BALL_CONFIDENCE_THRESHOLD)
+                
+                # Handle player reintroductions
+                missing_slots = get_missing_player_slots(trackers)
+                if missing_slots and detected_players:
+                    reintroductions = process_reintroductions(
+                        missing_slots,
+                        detected_players,
+                        trackers,
+                        unique_id_counter
+                    )
+                    
+                    for slot, data in reintroductions.items():
+                        print(f"Reintroducing {slot} at frame {frame_idx}")
+                        trackers[slot] = ObjectTracker(slot, data['unique_id'])
+                        if frame_idx not in prompts_per_frame_index:
+                            prompts_per_frame_index[frame_idx] = {}
+                        prompts_per_frame_index[frame_idx][slot] = data['detection']
+                        unique_id_counter = max(unique_id_counter, data['unique_id'] + 1)
                 
                 # Encode frame data
                 encoded_imgs_list, _, _ = sammodel.encode_image(
@@ -605,7 +547,7 @@ def main():
                     use_square_sizing=True
                 )
                 
-                # Handle initialization or reintroduction frame
+                # Handle initialization frame
                 if frame_idx in prompts_per_frame_index:
                     for obj_key, obj_prompts in prompts_per_frame_index[frame_idx].items():
                         print(f"Initializing tracking for {obj_key}")
@@ -623,7 +565,7 @@ def main():
                 ball_mask_result = np.zeros(frame.shape[0:2], dtype=bool)
                 rim_mask_result = np.zeros(frame.shape[0:2], dtype=bool)
                 
-                # First pass: generate all masks and update tracker information
+                # First pass: validate movements and generate masks
                 active_objects = []
                 for obj_key, tracker in trackers.items():
                     if not tracker.is_active:
@@ -640,10 +582,7 @@ def main():
                         print(f"Removing {obj_key} due to consecutive low scores")
                         continue
                     
-                    # Store memory
-                    obj_memory.store_result(frame_idx, mem_enc, obj_ptr)
-                    
-                    # Create mask and update tracker information
+                    # Create mask for movement validation
                     obj_mask = torch.nn.functional.interpolate(
                         mask_preds[:, best_mask_idx, :, :],
                         size=combined_mask_result.shape,
@@ -652,42 +591,44 @@ def main():
                     )
                     obj_mask_binary = (obj_mask > 0.0).cpu().numpy().squeeze()
                     
-                    # Update mask and check for jumps - this will deactivate tracker if jump is too large
-                    tracker.update_mask_and_centroid(obj_mask_binary)
+                    # Validate movement first - if invalid, skip all further processing
+                    if not tracker.update_mask_and_centroid(obj_mask_binary):
+                        continue
                     
-                    # Only add to active objects if still active after jump check
-                    if tracker.is_active:
-                        active_objects.append(obj_key)
-                        
-                        # Update visualization masks
-                        if obj_key == "ball":
-                            ball_mask_result = np.bitwise_or(ball_mask_result, obj_mask_binary)
-                        elif obj_key == "rim":
-                            rim_mask_result = np.bitwise_or(rim_mask_result, obj_mask_binary)
-                        else:
-                            player_mask_result = np.bitwise_or(player_mask_result, obj_mask_binary)
-                        combined_mask_result = np.bitwise_or(combined_mask_result, obj_mask_binary)
+                    # Only store memory and continue processing if movement was valid
+                    obj_memory.store_result(frame_idx, mem_enc, obj_ptr)
+                    active_objects.append(obj_key)
+                    
+                    # Update visualization masks
+                    if obj_key == "ball":
+                        ball_mask_result = np.bitwise_or(ball_mask_result, obj_mask_binary)
+                    elif obj_key == "rim":
+                        rim_mask_result = np.bitwise_or(rim_mask_result, obj_mask_binary)
+                    else:
+                        player_mask_result = np.bitwise_or(player_mask_result, obj_mask_binary)
+                    combined_mask_result = np.bitwise_or(combined_mask_result, obj_mask_binary)
                 
-                # Now check for overlaps and handle removal based on mask size
+                # Now check for overlaps using trajectory consistency
                 if frame_idx > 0:  # Skip first frame to allow initialization
-                    unique_id_counter, reintroduced = handle_reintroductions(
-                        frame_idx, 
-                        trackers, 
-                        detected_players, 
-                        prompts_per_frame_index, 
-                        unique_id_counter
-                    )
+                    to_remove = check_for_overlaps(trackers)
+                    if to_remove:
+                        for obj_key in to_remove:
+                            if trackers[obj_key].is_active:
+                                print(f"Removing {obj_key} due to less consistent trajectory in overlap")
+                                trackers[obj_key].is_active = False
+                                if obj_key in active_objects:
+                                    active_objects.remove(obj_key)
                 
                 # Log object tracking information
                 log_object_tracking(trackers, frame_idx, h5_file)
                 
-                # Create visualization frame - Modified to ensure ball is always on top
+                # Create visualization frame
                 vis_mask = np.zeros((*frame.shape[0:2], 3), dtype=np.uint8)
                 
                 # Layer the masks in specific order: rim -> players -> ball
-                vis_mask[rim_mask_result] = [0, 255, 0]         # Green for rim (bottom layer)
-                vis_mask[player_mask_result] = [255, 255, 255]  # White for players (middle layer)
-                vis_mask[ball_mask_result] = [0, 165, 255]      # Orange for ball (top layer)
+                vis_mask[rim_mask_result] = [0, 255, 0]         # Green for rim
+                vis_mask[player_mask_result] = [255, 255, 255]  # White for players
+                vis_mask[ball_mask_result] = [0, 165, 255]      # Orange for ball
                 
                 # Create info frame with object IDs and tracking details
                 info_frame = np.zeros((frame.shape[0], frame.shape[1], 3), dtype=np.uint8)
@@ -702,7 +643,7 @@ def main():
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
                 
                 # Add status information to info frame
-                active_players = len([k for k in active_objects if k not in ["ball", "rim"]])
+                active_players = len([k for k in active_objects if k.startswith("player_")])
                 cv2.putText(info_frame, f"Frame: {frame_idx}", (10, 30), 
                         cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
                 cv2.putText(info_frame, f"Active Players: {active_players}", 
@@ -726,6 +667,7 @@ def main():
         print(f"Mask video saved to: {output_masks}")
         print(f"Labels video saved to: {output_labels}")
         print(f"Tracking data saved to: {tracking_h5_path}")
+
 
 if __name__ == "__main__":
     main()
