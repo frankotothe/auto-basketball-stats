@@ -20,6 +20,23 @@ OVERLAP_FRAMES_THRESHOLD = 2  # Number of consecutive frames before removing ove
 RIM_CONFIDENCE_THRESHOLD = 0.5
 RIM_REINTRODUCTION_FRAMES = 4
 
+class YOLODetectionStore:
+    def __init__(self):
+        self.detections = {}  # frame_idx -> detections dict
+        
+    def add_frame_detections(self, frame_idx, players, ball, rim):
+        self.detections[frame_idx] = {
+            'players': players,
+            'ball': ball,
+            'rim': rim
+        }
+    
+    def get_frame_detections(self, frame_idx):
+        if frame_idx not in self.detections:
+            return [], None, None
+        dets = self.detections[frame_idx]
+        return dets['players'], dets['ball'], dets['rim']
+    
 class ObjectTracker:
     def __init__(self, obj_key, unique_id):
         self.obj_key = obj_key
@@ -157,6 +174,78 @@ def log_object_tracking(trackers, frame_idx, h5_file):
                     obj_dataset.attrs['centroid_x'] = tracker.last_centroid[0]
                     obj_dataset.attrs['centroid_y'] = tracker.last_centroid[1]
 
+def preprocess_video_with_yolo(video_path, yolo_model, total_frames):
+    """Batch process entire video with YOLO"""
+    print("Pre-processing video with YOLO...")
+    detection_store = YOLODetectionStore()
+    vcap = cv2.VideoCapture(video_path)
+    
+    # Process in batches of 32 frames (or adjust based on GPU memory)
+    batch_size = 32
+    frames = []
+    frame_indices = []
+    
+    for frame_idx in range(total_frames):
+        if frame_idx % 100 == 0:
+            print(f"Pre-processing frame {frame_idx}/{total_frames}")
+            
+        ok_frame, frame = vcap.read()
+        if not ok_frame:
+            break
+            
+        frames.append(frame)
+        frame_indices.append(frame_idx)
+        
+        # Process batch when full or at end
+        if len(frames) == batch_size or frame_idx == total_frames - 1:
+            results = yolo_model(frames, verbose=False)
+            
+            # Process each frame's results
+            for batch_idx, result in enumerate(results):
+                curr_frame_idx = frame_indices[batch_idx]
+                players = []
+                ball = None
+                rim = None
+                
+                for box in result.boxes:
+                    class_name = result.names[box.cls[0].item()].lower()
+                    x, y, w, h = box.xywh[0].tolist()
+                    confidence = box.conf[0].item()
+                    
+                    # Calculate normalized coordinates
+                    norm_x = x / frame.shape[1]
+                    norm_y = y / frame.shape[0]
+                    norm_x1 = (x - w/2) / frame.shape[1]
+                    norm_y1 = (y - h/2) / frame.shape[0]
+                    norm_x2 = (x + w/2) / frame.shape[1]
+                    norm_y2 = (y + h/2) / frame.shape[0]
+                    
+                    detection_data = {
+                        'confidence': confidence,
+                        'box_tlbr_norm_list': [[(norm_x1, norm_y1), (norm_x2, norm_y2)]],
+                        'fg_xy_norm_list': [(norm_x, norm_y)],
+                        'bg_xy_norm_list': [],
+                        'original_box': (int(x - w/2), int(y - h/2), int(w), int(h)),
+                        'centroid': (x, y)
+                    }
+                    
+                    if class_name == 'player' and confidence > PLAYER_CONFIDENCE_THRESHOLD:
+                        players.append(detection_data)
+                    elif class_name == 'basketball' and confidence > BALL_CONFIDENCE_THRESHOLD:
+                        ball = detection_data
+                    elif class_name == 'rim' and confidence > RIM_CONFIDENCE_THRESHOLD:
+                        rim = detection_data
+                
+                detection_store.add_frame_detections(curr_frame_idx, players, ball, rim)
+            
+            # Clear batch
+            frames = []
+            frame_indices = []
+    
+    vcap.release()
+    return detection_store
+
+
 def calculate_mask_iou(mask1, mask2):
     """Calculate Intersection over Union between two masks"""
     if mask1 is None or mask2 is None:
@@ -280,74 +369,24 @@ def is_detection_overlapping(detection, active_trackers):
                 
     return False
 
-def find_objects_in_frame(frame, yolo_model):
-    """Detect players, ball, and rim in a single frame using YOLO"""
-    results = yolo_model(frame, verbose=False)
-    players = []
-    ball = None
-    rim = None
-    
-    for result in results:
-        for box in result.boxes:
-            class_name = result.names[box.cls[0].item()].lower()
-            x, y, w, h = box.xywh[0].tolist()
-            confidence = box.conf[0].item()
-            
-            # Calculate normalized coordinates
-            norm_x = x / frame.shape[1]
-            norm_y = y / frame.shape[0]
-            norm_x1 = (x - w/2) / frame.shape[1]
-            norm_y1 = (y - h/2) / frame.shape[0]
-            norm_x2 = (x + w/2) / frame.shape[1]
-            norm_y2 = (y + h/2) / frame.shape[0]
-            
-            detection_data = {
-                'confidence': confidence,
-                'box_tlbr_norm_list': [[(norm_x1, norm_y1), (norm_x2, norm_y2)]],
-                'fg_xy_norm_list': [(norm_x, norm_y)],
-                'bg_xy_norm_list': [],
-                'original_box': (int(x - w/2), int(y - h/2), int(w), int(h)),
-                'centroid': (x, y)
-            }
-            
-            if class_name == 'player' and confidence > PLAYER_CONFIDENCE_THRESHOLD:
-                players.append(detection_data)
-            elif class_name == 'basketball' and confidence > BALL_CONFIDENCE_THRESHOLD:
-                ball = detection_data
-            elif class_name == 'rim' and confidence > RIM_CONFIDENCE_THRESHOLD:
-                rim = detection_data
-                
-    return players, ball, rim
+def find_objects_in_frame(frame_idx, detection_store):
+    """Get pre-computed detections for frame"""
+    return detection_store.get_frame_detections(frame_idx)
 
-def find_initialization_frame(video_path, yolo_model):
+def find_initialization_frame(detection_store):
     """Find frame with required players and ball"""
-    vcap = cv2.VideoCapture(video_path)
-    frame_idx = 0
-    
     print("Starting initialization frame search...")
-    try:
-        while frame_idx < MAX_FRAMES_TO_CHECK:
-            ok_frame, frame = vcap.read()
-            if not ok_frame:
-                break
-                
-            players, ball, _ = find_objects_in_frame(frame, yolo_model)  # Ignore rim during initialization
-            print(f"Frame {frame_idx}: Found {len(players)} players and {1 if ball else 0} ball")
-            
-            if len(players) >= 10 and ball is not None:
-                print(f"\nFound suitable frame at index {frame_idx}")
-                vcap.release()
-                return frame_idx, players, ball
-                
-            frame_idx += 1
+    
+    for frame_idx in range(MAX_FRAMES_TO_CHECK):
+        players, ball, _ = detection_store.get_frame_detections(frame_idx)
+        print(f"Frame {frame_idx}: Found {len(players)} players and {1 if ball else 0} ball")
         
-        vcap.release()
-        raise Exception(f"Could not find suitable initialization frame in first {MAX_FRAMES_TO_CHECK} frames")
-        
-    except Exception as e:
-        vcap.release()
-        print(f"Initialization failed: {str(e)}")
-        raise
+        if len(players) >= 10 and ball is not None:
+            print(f"\nFound suitable frame at index {frame_idx}")
+            return frame_idx, players, ball
+    
+    raise Exception(f"Could not find suitable initialization frame in first {MAX_FRAMES_TO_CHECK} frames")
+
 
 def encode_mask_rle(mask):
     """
@@ -429,9 +468,19 @@ def main():
     model_config_dict, sammodel = make_samv2_from_original_state_dict(model_path)
     sammodel.to(device=device, dtype=dtype)
     
-    # Find initialization frame
-    print("Searching for initialization frame...")
-    init_frame_idx, player_points, ball_point = find_initialization_frame(video_path, yolo_model)
+    # Get video properties
+    vcap = cv2.VideoCapture(video_path)
+    frame_width = int(vcap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_height = int(vcap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = int(vcap.get(cv2.CAP_PROP_FPS))
+    total_frames = int(vcap.get(cv2.CAP_PROP_FRAME_COUNT))
+    vcap.release()
+    
+    # Pre-process entire video with YOLO
+    detection_store = preprocess_video_with_yolo(video_path, yolo_model, total_frames)
+    
+    # Find initialization frame using pre-computed detections
+    init_frame_idx, player_points, ball_point = find_initialization_frame(detection_store)
     print(f"Found initialization frame at index {init_frame_idx}")
     
     # Create prompts from detections
@@ -442,7 +491,6 @@ def main():
             for i, point_data in enumerate(player_points)
         }
     }
-    # Add ball point
     prompts_per_frame_index[init_frame_idx]["ball"] = ball_point
     
     # Set up object trackers
@@ -462,23 +510,15 @@ def main():
     # Process video
     vcap = cv2.VideoCapture(video_path)
     
-    # Get video properties for output
-    frame_width = int(vcap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    frame_height = int(vcap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = int(vcap.get(cv2.CAP_PROP_FPS))
-    
     # Create separate VideoWriter objects for each output
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out_original = cv2.VideoWriter(output_original, fourcc, fps, (frame_width, frame_height))
     out_masks = cv2.VideoWriter(output_masks, fourcc, fps, (frame_width, frame_height))
     out_labels = cv2.VideoWriter(output_labels, fourcc, fps, (frame_width, frame_height))
     
-    vcap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-    
     try:
         os.makedirs(os.path.dirname(tracking_h5_path), exist_ok=True)
         with h5py.File(tracking_h5_path, 'w') as h5_file:
-            total_frames = int(vcap.get(cv2.CAP_PROP_FRAME_COUNT))
             h5_file.attrs['mask_downsample_factor'] = MASK_DOWNSAMPLE_FACTOR
             h5_file.attrs['video_width'] = frame_width
             h5_file.attrs['video_height'] = frame_height
@@ -492,11 +532,11 @@ def main():
                 if not ok_frame:
                     break
                 
-                # Get current detections
-                detected_players, detected_ball, detected_rim = find_objects_in_frame(frame, yolo_model)
+                # Get pre-computed detections for current frame
+                detected_players, detected_ball, detected_rim = find_objects_in_frame(frame_idx, detection_store)
                 
                 # Handle rim detection and tracking
-                if "ball" not in trackers or not trackers["rim"].is_active:
+                if "rim" not in trackers or not trackers["rim"].is_active:
                     rim_reintroduction.add_detection(detected_rim)
                     should_reintroduce, rim_data = rim_reintroduction.should_reintroduce()
                     
@@ -667,7 +707,6 @@ def main():
         print(f"Mask video saved to: {output_masks}")
         print(f"Labels video saved to: {output_labels}")
         print(f"Tracking data saved to: {tracking_h5_path}")
-
 
 if __name__ == "__main__":
     main()
