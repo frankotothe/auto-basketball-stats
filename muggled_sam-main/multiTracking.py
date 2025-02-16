@@ -7,6 +7,8 @@ import torch
 from lib.v2_sam.make_sam_v2 import make_samv2_from_original_state_dict
 from lib.demo_helpers.video_data_storage import SAM2VideoObjectResults
 from ultralytics import YOLO
+import argparse
+import json
 
 # Constants
 MAX_FRAMES_TO_CHECK = 250
@@ -450,6 +452,12 @@ def main():
     video_path = "../TestClip2.mp4"
     model_path = "model_weights/large_custom_sam2.pt"
     yolo_model_path = "model_weights/v11.pt"
+
+    # Parse command line arguments
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", help="Configuration file for segment processing")
+    args = parser.parse_args()
+    
     
     # Updated output paths for separate videos
     output_original = "output_original.mp4"
@@ -461,6 +469,17 @@ def main():
     device, dtype = "cpu", torch.float32
     if torch.cuda.is_available():
         device, dtype = "cuda", torch.bfloat16
+
+    # Override with config file if provided
+    if args.config:
+        with open(args.config, 'r') as f:
+            config = json.load(f)
+            video_path = config.get("video_path", video_path)
+            output_original = config.get("output_original", output_original)
+            output_masks = config.get("output_masks", output_masks)
+            output_labels = config.get("output_labels", output_labels)
+            tracking_h5_path = config.get("tracking_h5_path", tracking_h5_path)
+            unique_id_start = config.get("unique_id_start", unique_id_start)
     
     # Load models
     print("Loading models...")
@@ -484,7 +503,7 @@ def main():
     print(f"Found initialization frame at index {init_frame_idx}")
     
     # Create prompts from detections
-    unique_id_counter = 0
+    unique_id_counter = unique_id_start
     prompts_per_frame_index = {
         init_frame_idx: {
             f"player_{unique_id_counter+i}": point_data
