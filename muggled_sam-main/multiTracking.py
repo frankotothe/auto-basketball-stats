@@ -452,12 +452,12 @@ def main():
     video_path = "../TestClip2.mp4"
     model_path = "model_weights/large_custom_sam2.pt"
     yolo_model_path = "model_weights/v11.pt"
+    unique_id_start = 0  # Initialize here, before config handling
 
     # Parse command line arguments
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", help="Configuration file for segment processing")
     args = parser.parse_args()
-    
     
     # Updated output paths for separate videos
     output_original = "output_original.mp4"

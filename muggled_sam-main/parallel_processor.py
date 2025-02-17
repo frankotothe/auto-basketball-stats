@@ -8,6 +8,7 @@ import numpy as np
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import List, Tuple, Optional, Dict
 import json
+import argparse
 
 def split_video_segments(video_path: str, 
                           split_points: Optional[List[int]] = None, 
@@ -267,8 +268,6 @@ def main(video_path: str,
                 shutil.rmtree(temp_dir)
 
 if __name__ == "__main__":
-    import argparse
-    
     parser = argparse.ArgumentParser(description="Process video in parallel segments")
     parser.add_argument("video_path", help="Path to input video")
     parser.add_argument("script_path", help="Path to original processing script")
