@@ -11,7 +11,7 @@ import argparse
 import json
 
 # Constants
-MAX_FRAMES_TO_CHECK = 250
+MAX_FRAMES_TO_CHECK = 400
 CONFIDENCE_THRESHOLD = 0.6
 LOST_FRAMES_THRESHOLD = 10
 BALL_CONFIDENCE_THRESHOLD = 0.45
@@ -39,6 +39,19 @@ class YOLODetectionStore:
         dets = self.detections[frame_idx]
         return dets['players'], dets['ball'], dets['rim']
     
+def find_connected_components(mask):
+    """Find connected components in a binary mask"""
+    num_labels, labels = cv2.connectedComponents(mask.astype(np.uint8))
+    return num_labels, labels
+
+def get_component_areas(labels, num_labels):
+    """Get areas of all components"""
+    areas = []
+    for i in range(1, num_labels):  # Skip background (0)
+        area = np.sum(labels == i)
+        areas.append((i, area))
+    return sorted(areas, key=lambda x: x[1], reverse=True)
+
 class ObjectTracker:
     def __init__(self, obj_key, unique_id):
         self.obj_key = obj_key
@@ -54,6 +67,8 @@ class ObjectTracker:
         # Add position history
         self.centroid_history = []
         self.max_history = 3
+        # Add minimum area threshold as percentage of total mask area
+        self.min_component_area_ratio = 0.2  # Components smaller than 20% of largest will be removed
 
     def update_score(self, score):
         """Update tracker status based on score"""
@@ -64,15 +79,39 @@ class ObjectTracker:
         
         if self.consecutive_low_scores >= LOST_FRAMES_THRESHOLD:
             self.is_active = False
-            
+
     def update_mask_and_centroid(self, mask):
-        """Update mask, centroid, and area information"""
+        """Update mask, centroid, and area information with split mask handling"""
         if mask is not None and mask.any():
             # Store frame dimensions if not set
             if self.frame_width is None:
                 self.frame_height, self.frame_width = mask.shape
 
+            # Find connected components
+            num_labels, labels = find_connected_components(mask)
+            
+            if num_labels > 1:  # Mask is split
+                # Get areas of all components
+                component_areas = get_component_areas(labels, num_labels)
+                largest_area = component_areas[0][1]
+                
+                # Create new mask with only significant components
+                cleaned_mask = np.zeros_like(mask)
+                for label_idx, area in component_areas:
+                    # Keep component if it's large enough relative to the largest component
+                    if area >= largest_area * self.min_component_area_ratio:
+                        cleaned_mask = np.logical_or(cleaned_mask, labels == label_idx)
+                    else:
+                        print(f"Removing small component (area: {area}) from {self.obj_key}")
+                
+                # Update mask to cleaned version
+                mask = cleaned_mask
+
+            # Calculate centroid from cleaned mask
             y_indices, x_indices = np.where(mask)
+            if len(x_indices) == 0:  # If mask is empty after cleaning
+                return False
+                
             new_centroid = (np.mean(x_indices), np.mean(y_indices))
             
             # Check for large position changes for players only
@@ -90,7 +129,7 @@ class ObjectTracker:
                     print(f"Deactivating {self.obj_key} due to excessive movement: "
                           f"dx={x_movement:.1f}, dy={y_movement:.1f}")
                     self.is_active = False
-                    return False  # Indicate invalid update
+                    return False
 
             # Update centroid history before updating current centroid
             if self.last_centroid is not None:
@@ -124,13 +163,13 @@ class ObjectTracker:
                     self.is_active = False
                     return False
 
-            return True  # Indicate valid update
+            return True
         else:
             self.last_centroid = None
             self.last_mask = None
             self.mask_area = 0
             return False
-
+        
 class ReintroductionTracker:
     def __init__(self, confidence_threshold):
         self.consecutive_detections = []
@@ -383,7 +422,7 @@ def find_initialization_frame(detection_store):
         players, ball, _ = detection_store.get_frame_detections(frame_idx)
         print(f"Frame {frame_idx}: Found {len(players)} players and {1 if ball else 0} ball")
         
-        if len(players) >= 1 and ball is not None:
+        if len(players) >= 4 and ball is not None:
             print(f"\nFound suitable frame at index {frame_idx}")
             return frame_idx, players, ball
     
