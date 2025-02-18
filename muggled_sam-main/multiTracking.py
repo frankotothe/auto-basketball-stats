@@ -183,7 +183,7 @@ def preprocess_video_with_yolo(video_path, yolo_model, total_frames):
     vcap = cv2.VideoCapture(video_path)
     
     # Process in batches of 32 frames (or adjust based on GPU memory)
-    batch_size = 32
+    batch_size = 12
     frames = []
     frame_indices = []
     
@@ -383,7 +383,7 @@ def find_initialization_frame(detection_store):
         players, ball, _ = detection_store.get_frame_detections(frame_idx)
         print(f"Frame {frame_idx}: Found {len(players)} players and {1 if ball else 0} ball")
         
-        if len(players) >= 10 and ball is not None:
+        if len(players) >= 1 and ball is not None:
             print(f"\nFound suitable frame at index {frame_idx}")
             return frame_idx, players, ball
     
@@ -480,6 +480,7 @@ def main():
             output_labels = config.get("output_labels", output_labels)
             tracking_h5_path = config.get("tracking_h5_path", tracking_h5_path)
             unique_id_start = config.get("unique_id_start", unique_id_start)
+            progress_file = config.get("progress_file")
     
     # Load models
     print("Loading models...")
@@ -716,6 +717,15 @@ def main():
                 out_original.write(frame)
                 out_masks.write(vis_mask)
                 out_labels.write(info_frame)
+
+                # Add progress file update here
+                if progress_file:
+                    try:
+                        with open(progress_file, 'w') as f:
+                            f.write(str(frame_idx))
+                    except IOError:
+                        pass  # Silently handle write errors to prevent processing interruption
+                        
                     
     finally:
         vcap.release()
