@@ -7,14 +7,12 @@ from scipy.spatial.distance import cdist
 import matplotlib.pyplot as plt
 
 def rle_decode(rle, shape):
-    """Decode run-length encoded data into a binary mask."""
     mask = np.zeros(shape[0] * shape[1], dtype=bool)
     for start, end in rle:
         mask[start:end] = True
     return mask.reshape(shape)
 
 def sort_points(points):
-    """Sort points to follow the curve from one end to the other."""
     sorted_indices = [np.lexsort((points[:, 1], points[:, 0]))[0]]
     remaining = set(range(len(points)))
     remaining.remove(sorted_indices[0])
@@ -28,7 +26,6 @@ def sort_points(points):
     return points[sorted_indices]
 
 def detect_corners(points, min_angle=20, min_dist=15):
-    """Detect corners along a curve of points."""
     sorted_points = sort_points(points)
     window_size = 25
     stride = 2
@@ -63,7 +60,6 @@ def detect_corners(points, min_angle=20, min_dist=15):
             segments.append(segment)
         start_idx = corner_idx
     
-    # Add the last segment
     last_segment = sorted_points[start_idx:]
     if len(last_segment) >= 5:
         segments.append(last_segment)
@@ -71,7 +67,6 @@ def detect_corners(points, min_angle=20, min_dist=15):
     return segments if segments else [sorted_points]
 
 def fit_line(points, is_horizontal=True):
-    """Fit a line to a set of points using RANSAC."""
     if len(points) < 2:
         return None
         
@@ -86,7 +81,6 @@ def fit_line(points, is_horizontal=True):
         return None
 
 def get_keyway_corners(mask):
-    """Extract the corners of the keyway mask."""
     mask_uint8 = mask.astype(np.uint8) * 255
     contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     
@@ -95,30 +89,26 @@ def get_keyway_corners(mask):
     
     largest_contour = max(contours, key=cv2.contourArea)
     
-    # Try different epsilon values to get 4 corners
     for eps_factor in [0.02, 0.01, 0.03, 0.05, 0.1]:
         epsilon = eps_factor * cv2.arcLength(largest_contour, True)
         approx = cv2.approxPolyDP(largest_contour, epsilon, True)
         if len(approx) == 4:
             break
     
-    # Convert to [y, x] format
     corners = np.array([[p[0][1], p[0][0]] for p in approx])
     
-    # Sort corners clockwise
     center = np.mean(corners, axis=0)
     angles = np.arctan2(corners[:, 0] - center[0], corners[:, 1] - center[1])
     return corners[np.argsort(angles)]
 
 def create_line_from_points(p1, p2):
-    """Create a line equation from two points."""
     y1, x1 = p1
     y2, x2 = p2
     
     dx = x2 - x1
     dy = y2 - y1
     
-    if abs(dx) < 1e-10:  # Nearly vertical line
+    if abs(dx) < 1e-10:
         return (0, x1, False)
     else:
         slope = dy / dx
@@ -126,10 +116,8 @@ def create_line_from_points(p1, p2):
         return (slope, intercept, abs(slope) < 1)
 
 def match_boundary_lines(keyway_lines, boundary_segments, keyway_mask, mask_shape):
-    """Match keyway lines with boundary segments, looking outward from the keyway."""
     matches = []
     
-    # Find the center of the keyway
     keyway_points = np.column_stack(np.where(keyway_mask))
     if len(keyway_points) == 0:
         return [None] * len(keyway_lines)
@@ -140,11 +128,9 @@ def match_boundary_lines(keyway_lines, boundary_segments, keyway_mask, mask_shap
         best_match = None
         best_score = -1
         
-        # Get the midpoint of the keyway line
         p1, p2 = keyway_points
         midpoint = np.mean(keyway_points, axis=0)
         
-        # Get the outward direction vector (from keyway center to midpoint)
         outward_vector = midpoint - keyway_center
         outward_vector = outward_vector / np.linalg.norm(outward_vector)
         
@@ -159,39 +145,29 @@ def match_boundary_lines(keyway_lines, boundary_segments, keyway_mask, mask_shap
             b_slope, b_intercept = boundary_fit
             boundary_line = (b_slope, b_intercept, is_horizontal)
             
-            # Check if lines are roughly parallel (slopes similar)
             slope_diff = abs(slope - b_slope)
             if is_horizontal and slope_diff > 0.5:
                 continue
             
-            # Calculate midpoint of boundary segment
             boundary_midpoint = np.mean(boundary_points, axis=0)
             
-            # Vector from keyway line midpoint to boundary midpoint
             to_boundary_vector = boundary_midpoint - midpoint
             
-            # Normalize
             if np.linalg.norm(to_boundary_vector) > 0:
                 to_boundary_vector = to_boundary_vector / np.linalg.norm(to_boundary_vector)
             else:
                 continue
             
-            # Compute directional score (dot product of vectors)
-            # Higher when boundary is in the outward direction from keyway
             direction_score = np.dot(outward_vector, to_boundary_vector)
             
-            # Only consider boundaries in the outward direction
             if direction_score <= 0:
                 continue
                 
-            # Calculate distance
             distances = cdist(keyway_points, boundary_points)
             distance = np.min(distances)
             
-            # Calculate length (proxy for confidence)
             length = np.max(boundary_points[:, 1]) - np.min(boundary_points[:, 1]) if is_horizontal else np.max(boundary_points[:, 0]) - np.min(boundary_points[:, 0])
             
-            # Score combines length, inverse distance, and direction alignment
             score = (length / (1 + distance)) * direction_score
             
             if score > best_score:
@@ -202,10 +178,142 @@ def match_boundary_lines(keyway_lines, boundary_segments, keyway_mask, mask_shap
     
     return matches
 
+def identify_middle_line(matched_boundary_lines, keyway_mask):
+    y_indices, x_indices = np.where(keyway_mask)
+    center_y = np.mean(y_indices)
+    center_x = np.mean(x_indices)
+    
+    closest_dist = float('inf')
+    middle_line_idx = None
+    
+    for i, match in enumerate(matched_boundary_lines):
+        if match is None:
+            continue
+            
+        line, points = match
+        slope, intercept, is_horizontal = line
+        
+        if is_horizontal:
+            dist = abs(center_y - (slope * center_x + intercept))
+        else:
+            dist = abs(center_x - (slope * center_y + intercept))
+        
+        if dist < closest_dist:
+            closest_dist = dist
+            middle_line_idx = i
+    
+    return middle_line_idx
+
+def compute_extended_boundaries(matched_boundary_lines, middle_line_idx, mask_shape):
+    height, width = mask_shape
+    top_ext = right_ext = bottom_ext = left_ext = 0
+    
+    middle_match = matched_boundary_lines[middle_line_idx]
+    middle_slope, middle_intercept, middle_is_horizontal = middle_match[0]
+    
+    intersections = []
+    
+    for i, match in enumerate(matched_boundary_lines):
+        if match is None or i == middle_line_idx:
+            continue
+            
+        line, points = match
+        slope, intercept, is_horizontal = line
+        
+        slope_diff = abs(middle_slope - slope)
+        if slope_diff < 1e-6:
+            continue
+            
+        if middle_is_horizontal and is_horizontal:
+            x = (intercept - middle_intercept) / (middle_slope - slope)
+            y = middle_slope * x + middle_intercept
+        elif not middle_is_horizontal and not is_horizontal:
+            y = (intercept - middle_intercept) / (middle_slope - slope)
+            x = middle_slope * y + middle_intercept
+        elif middle_is_horizontal:
+            y = (middle_slope * intercept + middle_intercept) / (1 - middle_slope * slope)
+            x = slope * y + intercept
+        else:
+            x = (middle_slope * intercept + middle_intercept) / (1 - middle_slope * slope)
+            y = slope * x + intercept
+        
+        if not (np.isnan(x) or np.isnan(y) or np.isinf(x) or np.isinf(y)):
+            intersections.append((int(x), int(y)))
+            
+            if x < 0:
+                left_ext = max(left_ext, int(-x + 50))
+            elif x >= width:
+                right_ext = max(right_ext, int(x - width + 50))
+                
+            if y < 0:
+                top_ext = max(top_ext, int(-y + 50))
+            elif y >= height:
+                bottom_ext = max(bottom_ext, int(y - height + 50))
+    
+    return intersections, (top_ext, right_ext, bottom_ext, left_ext)
+
+def extend_canvas_and_lines(canvas, extension, intersections, matched_boundary_lines, keyway_mask, three_mask):
+    top_ext, right_ext, bottom_ext, left_ext = extension
+    
+    orig_height, orig_width = canvas.shape[:2]
+    
+    new_height = orig_height + top_ext + bottom_ext
+    new_width = orig_width + left_ext + right_ext
+    extended_canvas = np.zeros((new_height, new_width, 3), dtype=np.uint8)
+    
+    extended_canvas[top_ext:top_ext+orig_height, left_ext:left_ext+orig_width] = canvas
+    
+    extended_keyway = np.zeros((new_height, new_width), dtype=bool)
+    extended_keyway[top_ext:top_ext+orig_height, left_ext:left_ext+orig_width] = keyway_mask
+
+    extended_three = np.zeros((new_height, new_width), dtype=bool)
+    extended_three[top_ext:top_ext+orig_height, left_ext:left_ext+orig_width] = three_mask
+    
+    extended_canvas[extended_keyway] = (0, 255, 0)
+    extended_canvas[extended_three] = (0, 0, 255)
+    
+    colors = [
+        (255, 0, 0), (0, 0, 255), (255, 255, 0), (255, 0, 255), (0, 255, 255),
+        (128, 0, 0), (0, 128, 0), (0, 0, 128), (128, 128, 0), (128, 0, 128),
+        (0, 128, 128), (255, 165, 0)
+    ]
+    
+    for i, match in enumerate(matched_boundary_lines):
+        if match is None:
+            continue
+            
+        line, points = match
+        slope, intercept, is_horizontal = line
+        
+        color = colors[i % len(colors)]
+        
+        if is_horizontal:
+            x1 = -left_ext
+            x2 = orig_width + right_ext
+            y1 = int(slope * x1 + intercept) + top_ext
+            y2 = int(slope * x2 + intercept) + top_ext
+        else:
+            y1 = -top_ext
+            y2 = orig_height + bottom_ext
+            x1 = int(slope * y1 + intercept) + left_ext
+            x2 = int(slope * y2 + intercept) + left_ext
+        
+        mid_x = int((x1 + x2) / 2)
+        mid_y = int((y1 + y2) / 2)
+        cv2.putText(extended_canvas, f"B{i}", (mid_x, mid_y), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+    
+    for x, y in intersections:
+        adj_x = x + left_ext
+        adj_y = y + top_ext
+        
+        cv2.circle(extended_canvas, (adj_x, adj_y), 8, (255, 255, 255), -1)
+        cv2.circle(extended_canvas, (adj_x, adj_y), 6, (100, 100, 200), -1)
+    
+    return extended_canvas
+
 def find_boundary_lines(h5_file_path, frame_number=180):
-    """Extract keyway corners and identify matching boundary lines."""
     with h5py.File(h5_file_path, 'r') as f:
-        # Access frame data
         frame_key = f'frame_{frame_number}'
         if frame_key not in f['frames']:
             print(f"Frame {frame_number} not found")
@@ -213,7 +321,6 @@ def find_boundary_lines(h5_file_path, frame_number=180):
             
         frame = f['frames'][frame_key]
         
-        # Get mask dimensions
         detection_keys = list(frame.keys())
         if not detection_keys:
             print("No detections found in this frame")
@@ -222,13 +329,11 @@ def find_boundary_lines(h5_file_path, frame_number=180):
         first_detection = frame[detection_keys[0]]
         mask_shape = tuple(first_detection['rle'].attrs['shape'])
         
-        # Create masks for classes
         boundary_mask = np.zeros(mask_shape, dtype=bool)
         keyway_mask = np.zeros(mask_shape, dtype=bool)
         three_mask = np.zeros(mask_shape, dtype=bool)
         boundary_count = 0
         
-        # Extract masks by class
         for detection_key in frame.keys():
             detection = frame[detection_key]
             class_id = detection.attrs['class_id']
@@ -246,7 +351,6 @@ def find_boundary_lines(h5_file_path, frame_number=180):
         
         print(f"Number of boundary objects detected: {boundary_count}")
         
-        # Extract keyway corners
         keyway_corners = get_keyway_corners(keyway_mask)
         if keyway_corners is None or len(keyway_corners) < 3:
             print("Failed to extract keyway corners")
@@ -254,7 +358,6 @@ def find_boundary_lines(h5_file_path, frame_number=180):
         
         print(f"Found {len(keyway_corners)} keyway corners")
         
-        # Create lines from keyway corners
         keyway_lines = []
         for i in range(len(keyway_corners)):
             p1 = keyway_corners[i]
@@ -262,38 +365,31 @@ def find_boundary_lines(h5_file_path, frame_number=180):
             line = create_line_from_points(p1, p2)
             keyway_lines.append((line, np.array([p1, p2])))
         
-        # Process boundary to get skeleton
         boundary_uint8 = boundary_mask.astype(np.uint8) * 255
         kernel = np.ones((3, 3), np.uint8)
         eroded = cv2.erode(boundary_uint8, kernel, iterations=1)
         skeleton = cv2.subtract(boundary_uint8, eroded)
         
-        # Get skeleton points
         skeleton_points = np.column_stack(np.where(skeleton > 0))
         
         if len(skeleton_points) < 10:
             print("Not enough boundary points found")
             return None
         
-        # Cluster points into segments
         clustering = DBSCAN(eps=20, min_samples=5).fit(skeleton_points)
         labels = clustering.labels_
         
-        # Number of clusters
         n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
         print(f"Number of boundary segments detected: {n_clusters}")
         
-        # Group points by cluster
         clustered_points = [[] for _ in range(n_clusters)]
         for i, label in enumerate(labels):
             if label != -1:  # Skip noise points
                 clustered_points[label].append(skeleton_points[i])
         
-        # Convert lists to numpy arrays
         for i in range(n_clusters):
             clustered_points[i] = np.array(clustered_points[i])
         
-        # Split segments at corners
         boundary_segments = []
         for points in clustered_points:
             if len(points) >= 10:
@@ -302,12 +398,9 @@ def find_boundary_lines(h5_file_path, frame_number=180):
         
         print(f"Total boundary segments after corner splitting: {len(boundary_segments)}")
         
-        # Create visualization canvases
-        # Canvas 1: Boundary segments with different colors
         boundary_canvas = np.zeros((mask_shape[0], mask_shape[1], 3), dtype=np.uint8)
         boundary_canvas[keyway_mask] = (0, 255, 0)  # Green for keyway
         
-        # Draw keyway corners and lines
         for corner in keyway_corners:
             cv2.circle(boundary_canvas, (corner[1], corner[0]), 5, (255, 255, 255), -1)
         
@@ -315,46 +408,28 @@ def find_boundary_lines(h5_file_path, frame_number=180):
             p1, p2 = points
             cv2.line(boundary_canvas, (p1[1], p1[0]), (p2[1], p2[0]), (255, 255, 255), 2)
         
-        # Generate distinct colors
         colors = [
-            (255, 0, 0),    # Red
-            (0, 0, 255),    # Blue
-            (255, 255, 0),  # Yellow
-            (255, 0, 255),  # Magenta
-            (0, 255, 255),  # Cyan
-            (128, 0, 0),    # Maroon
-            (0, 128, 0),    # Dark Green
-            (0, 0, 128),    # Navy
-            (128, 128, 0),  # Olive
-            (128, 0, 128),  # Purple
-            (0, 128, 128),  # Teal
-            (255, 165, 0),  # Orange
-            (255, 192, 203),# Pink
-            (165, 42, 42),  # Brown
-            (240, 230, 140),# Khaki
-            (70, 130, 180), # Steel Blue
+            (255, 0, 0), (0, 0, 255), (255, 255, 0), (255, 0, 255), (0, 255, 255),
+            (128, 0, 0), (0, 128, 0), (0, 0, 128), (128, 128, 0), (128, 0, 128),
+            (0, 128, 128), (255, 165, 0), (255, 192, 203), (165, 42, 42),
+            (240, 230, 140), (70, 130, 180)
         ]
         
-        # Ensure enough colors
         while len(colors) < len(boundary_segments):
             new_color = (np.random.randint(0, 256), np.random.randint(0, 256), np.random.randint(0, 256))
             colors.append(new_color)
         
-        # Draw boundary segments
         for i, points in enumerate(boundary_segments):
             color = colors[i % len(colors)]
             
-            # Draw the points
             for point in points:
                 boundary_canvas[point[0], point[1]] = color
             
-            # Try to fit a line and draw it
             for is_horizontal in [True, False]:
                 line_fit = fit_line(points, is_horizontal)
                 if line_fit is not None:
                     slope, intercept = line_fit
                     
-                    # Get line endpoints
                     if is_horizontal:
                         min_x = np.min(points[:, 1])
                         max_x = np.max(points[:, 1])
@@ -368,18 +443,14 @@ def find_boundary_lines(h5_file_path, frame_number=180):
                         x2 = int(slope * max_y + intercept)
                         y1, y2 = min_y, max_y
                     
-                    # Draw the line
                     cv2.line(boundary_canvas, (x1, y1), (x2, y2), color, 2)
                     
-                    # Label the line with its index
                     text_pos = (int((x1 + x2) / 2), int((y1 + y2) / 2))
                     cv2.putText(boundary_canvas, str(i), text_pos, cv2.FONT_HERSHEY_SIMPLEX, 
                                0.7, (255, 255, 255), 2)
                     
-                    # Only draw one successful fit
                     break
         
-        # Create a legend
         legend_canvas = np.zeros((200, mask_shape[1], 3), dtype=np.uint8)
         start_y = 20
         for i in range(min(len(boundary_segments), len(colors))):
@@ -389,24 +460,19 @@ def find_boundary_lines(h5_file_path, frame_number=180):
             cv2.line(legend_canvas, (150, start_y - 5), (200, start_y - 5), color, 3)
             start_y += 15
         
-        # Match boundary lines to keyway lines
         matched_boundary_lines = match_boundary_lines(keyway_lines, boundary_segments, keyway_mask, mask_shape)
         
-        # Canvas 3: Matched lines
         match_canvas = np.zeros((mask_shape[0], mask_shape[1], 3), dtype=np.uint8)
         match_canvas[keyway_mask] = (0, 255, 0)  # Green for keyway
         
-        # Draw keyway lines
         for i, (line, points) in enumerate(keyway_lines):
             p1, p2 = points
             cv2.line(match_canvas, (p1[1], p1[0]), (p2[1], p2[0]), (255, 255, 255), 2)
-            # Label the keyway line
             mid_x = int((p1[1] + p2[1]) / 2)
             mid_y = int((p1[0] + p2[0]) / 2)
             cv2.putText(match_canvas, f"K{i}", (mid_x, mid_y), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         
-        # Draw matched boundary lines
         print("\nKeyway to Boundary Line Matches:")
         for i, match in enumerate(matched_boundary_lines):
             if match is None:
@@ -416,10 +482,8 @@ def find_boundary_lines(h5_file_path, frame_number=180):
             line, points = match
             slope, intercept, is_horizontal = line
             
-            # Use a distinct color for each match
             color = colors[i % len(colors)]
             
-            # Get endpoints for visualization
             if is_horizontal:
                 min_x = np.min(points[:, 1])
                 max_x = np.max(points[:, 1])
@@ -433,32 +497,45 @@ def find_boundary_lines(h5_file_path, frame_number=180):
                 x2 = int(slope * max_y + intercept)
                 y1, y2 = min_y, max_y
             
-            # Draw thick line
             cv2.line(match_canvas, (x1, y1), (x2, y2), color, 3)
             
-            # Label which keyway line this matches
             mid_x = int((x1 + x2) / 2)
             mid_y = int((y1 + y2) / 2)
             cv2.putText(match_canvas, f"B{i}", (mid_x, mid_y), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
             
-            # Print match info
             segment_idx = next((idx for idx, seg in enumerate(boundary_segments) 
                               if np.array_equal(seg, points)), -1)
             print(f"  Keyway line {i} -> Boundary segment {segment_idx}")
         
-        # Draw Three Point Line
-        boundary_canvas[three_mask] = (0, 0, 255)  # Green for keyway
-
-        # Combine visualization canvases vertically
+        boundary_canvas[three_mask] = (0, 0, 255)  # Blue for three
+        
+        middle_line_idx = identify_middle_line(matched_boundary_lines, keyway_mask)
+        if middle_line_idx is not None:
+            print(f"\nIdentified middle line: B{middle_line_idx}")
+            
+            intersections, extension = compute_extended_boundaries(
+                matched_boundary_lines, middle_line_idx, mask_shape
+            )
+            print(f"Found {len(intersections)} intersection points")
+            print(f"Canvas extension needed: {extension}")
+            
+            extended_canvas = extend_canvas_and_lines(
+                match_canvas, extension, intersections, matched_boundary_lines, keyway_mask, three_mask
+            )
+            
+            cv2.imshow(f"Frame {frame_number} Extended Lines", extended_canvas)
+            cv2.imwrite(f"frame_{frame_number}_extended_lines.png", extended_canvas)
+        else:
+            print("Could not identify a middle line")
+            extended_canvas = match_canvas.copy()
+        
         combined_canvas = np.vstack([boundary_canvas, legend_canvas, match_canvas])
         
-        # Display results
         cv2.imshow(f"Frame {frame_number} Boundary Analysis", combined_canvas)
         cv2.waitKey(0)
         cv2.destroyAllWindows()
         
-        # Save images
         cv2.imwrite(f"frame_{frame_number}_boundary_segments.png", boundary_canvas)
         cv2.imwrite(f"frame_{frame_number}_matches.png", match_canvas)
         cv2.imwrite(f"frame_{frame_number}_combined.png", combined_canvas)
@@ -469,16 +546,20 @@ def find_boundary_lines(h5_file_path, frame_number=180):
         print(f"- After splitting at corners, there are {len(boundary_segments)} total segments")
         print(f"- Found {len(keyway_corners)} keyway corners forming {len(keyway_lines)} edges")
         print(f"- Successfully matched {sum(1 for m in matched_boundary_lines if m is not None)}/{len(keyway_lines)} keyway lines")
+        if middle_line_idx is not None:
+            print(f"- Identified B{middle_line_idx} as the middle line")
+            print(f"- Found {len(intersections)} intersection points between extended lines")
         
-        # Return results
         return {
             'keyway_corners': keyway_corners,
             'keyway_lines': keyway_lines,
             'boundary_segments': boundary_segments,
             'boundary_lines': matched_boundary_lines,
-            'canvas': combined_canvas
+            'middle_line_idx': middle_line_idx,
+            'intersections': intersections if middle_line_idx is not None else [],
+            'canvas': combined_canvas,
+            'extended_canvas': extended_canvas
         }
 
-# Example usage
 if __name__ == "__main__":
-    results = find_boundary_lines('output.h5', frame_number=59)
+    results = find_boundary_lines('output.h5', frame_number=40)
