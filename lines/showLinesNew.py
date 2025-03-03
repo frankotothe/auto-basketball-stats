@@ -172,6 +172,56 @@ def get_keyway_corners(mask):
     angles = np.arctan2(corners[:, 0] - center[0], corners[:, 1] - center[1])
     return corners[np.argsort(angles)]
 
+def identify_free_throw_line(keyway_lines, three_mask):
+    if not keyway_lines or three_mask is None or not np.any(three_mask):
+        return None
+    
+    # Find center of three-point line
+    three_points = np.column_stack(np.where(three_mask))
+    if len(three_points) == 0:
+        return None
+        
+    three_center = np.mean(three_points, axis=0)
+    
+    # Calculate distance from each keyway line to three-point center
+    min_dist = float('inf')
+    free_throw_idx = None
+    
+    for i, (line_params, line_points) in enumerate(keyway_lines):
+        slope, intercept, is_horizontal = line_params
+        
+        # Calculate perpendicular distance from point to line
+        if is_horizontal:
+            dist = abs(three_center[0] - (slope * three_center[1] + intercept))
+        else:
+            dist = abs(three_center[1] - (slope * three_center[0] + intercept))
+            
+        if dist < min_dist:
+            min_dist = dist
+            free_throw_idx = i
+    
+    return free_throw_idx
+
+def filter_keyway_lines(keyway_lines, free_throw_idx):
+    if free_throw_idx is None or len(keyway_lines) < 3:
+        return keyway_lines
+    
+    # Find baseline (opposite to free-throw line)
+    baseline_idx = (free_throw_idx + 2) % 4
+    
+    # Find perpendicular lines (adjacent to baseline)
+    perp_idx1 = (baseline_idx + 1) % 4
+    perp_idx2 = (baseline_idx + 3) % 4
+    
+    # Keep only these three lines
+    filtered_lines = []
+    for i, line in enumerate(keyway_lines):
+        if i in [baseline_idx, perp_idx1, perp_idx2]:
+            filtered_lines.append(line)
+    
+    return filtered_lines
+
+
 def fit_line(points, is_horizontal=True):
     """Fit line to points using RANSAC"""
     if len(points) < 5:  # Need enough points for robust fitting
@@ -492,6 +542,17 @@ def create_visualization(masks, matched_lines, middle_idx, intersections, extens
             cv2.circle(canvas, (adj_x, adj_y), 8, (255, 255, 255), -1)
             cv2.circle(canvas, (adj_x, adj_y), 6, (100, 100, 200), -1)
     
+    # If three_mask is available, visualize the center point
+    if three_mask is not None and np.any(three_mask):
+        three_y, three_x = np.where(three_mask)
+        if len(three_y) > 0:
+            center_y, center_x = int(np.mean(three_y)), int(np.mean(three_x))
+            # Draw circle at three-point line center
+            adj_x, adj_y = center_x + left_ext, center_y + top_ext
+            cv2.circle(canvas, (adj_x, adj_y), 12, (0, 255, 255), -1)
+            cv2.circle(canvas, (adj_x, adj_y), 8, (255, 0, 0), -1)
+            cv2.putText(canvas, "3PT", (adj_x + 15, adj_y + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+    
     # Draw frame border to indicate original image boundaries
     cv2.rectangle(canvas, (left_ext, top_ext), (left_ext + width, top_ext + height), (255, 255, 255), 2)
     
@@ -500,6 +561,8 @@ def create_visualization(masks, matched_lines, middle_idx, intersections, extens
         cv2.putText(canvas, f"Frame: {frame_number}", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
     
     return canvas
+
+
 def process_single_frame(h5_file, frame_number, save_images=False):
     """Process a single frame with all optimizations"""
     # Load frame data
@@ -516,6 +579,7 @@ def process_single_frame(h5_file, frame_number, save_images=False):
         
     boundary_mask = masks[0]
     keyway_mask = masks[1]
+    three_mask = masks.get(2, None)  # Get three-point line mask if available
     
     # Get keyway corners
     keyway_corners = get_keyway_corners(keyway_mask)
@@ -529,11 +593,17 @@ def process_single_frame(h5_file, frame_number, save_images=False):
         p2 = keyway_corners[(i + 1) % len(keyway_corners)]
         keyway_lines.append((create_line_from_points(p1, p2), np.array([p1, p2])))
     
+    # Identify free-throw line
+    free_throw_idx = identify_free_throw_line(keyway_lines, three_mask)
+    
+    # Filter keyway lines to keep only baseline and perpendicular lines
+    filtered_keyway_lines = filter_keyway_lines(keyway_lines, free_throw_idx)
+    
     # Process boundary segments
     boundary_segments = process_boundary_segments(boundary_mask)
     
-    # Match boundary lines
-    matched_lines = match_boundary_lines(keyway_lines, boundary_segments, keyway_mask)
+    # Match boundary lines with filtered keyway lines
+    matched_lines = match_boundary_lines(filtered_keyway_lines, boundary_segments, keyway_mask)
     
     # Find middle line
     middle_idx = identify_middle_line(matched_lines, keyway_mask)
@@ -552,10 +622,12 @@ def process_single_frame(h5_file, frame_number, save_images=False):
         'frame': frame_number,
         'result_image': result_image,
         'keyway_corners': keyway_corners,
+        'free_throw_idx': free_throw_idx,
         'matched_lines': matched_lines,
         'middle_idx': middle_idx,
         'intersections': intersections
     }
+
 def process_batch(args):
     """Process a batch of frames - designed for multiprocessing"""
     batch, h5_file, save_images = args
