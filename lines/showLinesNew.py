@@ -404,18 +404,29 @@ def compute_intersections(matched_lines, middle_idx, shape):
     
     return intersections, (top_ext, right_ext, bottom_ext, left_ext)
 
-def create_visualization(masks, matched_lines, middle_idx, intersections, extensions):
-    """Create visualization with boundary lines and intersections"""
+def create_visualization(masks, matched_lines, middle_idx, intersections, extensions, frame_number=None):
+    """Create visualization with boundary lines and intersections with automatic 40% expansion"""
     keyway_mask = masks.get(1, None)
     three_mask = masks.get(2, None)
     
+    # Original frame dimensions (or default if keyway_mask is None)
     if keyway_mask is None:
-        return None
+        height, width = 480, 640  # Default dimensions if no mask available
+    else:
+        height, width = keyway_mask.shape
         
-    height, width = keyway_mask.shape
+    # Calculate 40% expansion in each direction
+    top_ext_auto = int(height * 0.4)
+    right_ext_auto = int(width * 0.4)
+    bottom_ext_auto = int(height * 0.4)
+    left_ext_auto = int(width * 0.4)
     
-    # Apply extensions
-    top_ext, right_ext, bottom_ext, left_ext = extensions
+    # Apply extensions (combine automatic expansion with computed extensions if available)
+    extensions = extensions or (0, 0, 0, 0)
+    top_ext = max(top_ext_auto, extensions[0])
+    right_ext = max(right_ext_auto, extensions[1])
+    bottom_ext = max(bottom_ext_auto, extensions[2])
+    left_ext = max(left_ext_auto, extensions[3])
     
     new_height = height + top_ext + bottom_ext
     new_width = width + left_ext + right_ext
@@ -423,17 +434,19 @@ def create_visualization(masks, matched_lines, middle_idx, intersections, extens
     # Create extended canvas
     canvas = np.zeros((new_height, new_width, 3), dtype=np.uint8)
     
-    # Create extended masks
-    extended_keyway = np.zeros((new_height, new_width), dtype=bool)
-    extended_keyway[top_ext:top_ext+height, left_ext:left_ext+width] = keyway_mask
-    
-    extended_three = np.zeros((new_height, new_width), dtype=bool)
-    if three_mask is not None:
-        extended_three[top_ext:top_ext+height, left_ext:left_ext+width] = three_mask
-    
-    # Apply masks to canvas
-    canvas[extended_keyway] = (0, 255, 0)  # Green for keyway
-    canvas[extended_three] = (0, 0, 255)   # Blue for three
+    # Handle the case where keyway_mask is available
+    if keyway_mask is not None:
+        # Create extended masks
+        extended_keyway = np.zeros((new_height, new_width), dtype=bool)
+        extended_keyway[top_ext:top_ext+height, left_ext:left_ext+width] = keyway_mask
+        
+        extended_three = np.zeros((new_height, new_width), dtype=bool)
+        if three_mask is not None:
+            extended_three[top_ext:top_ext+height, left_ext:left_ext+width] = three_mask
+        
+        # Apply masks to canvas
+        canvas[extended_keyway] = (0, 255, 0)  # Green for keyway
+        canvas[extended_three] = (0, 0, 255)   # Blue for three
     
     # Line colors
     colors = [
@@ -441,44 +454,52 @@ def create_visualization(masks, matched_lines, middle_idx, intersections, extens
         (128, 0, 0), (0, 128, 0), (0, 0, 128), (128, 128, 0), (128, 0, 128)
     ]
     
-    # Draw boundary lines
-    for i, match in enumerate(matched_lines):
-        if match is None:
-            continue
+    # Draw boundary lines if available
+    if matched_lines:
+        for i, match in enumerate(matched_lines):
+            if match is None:
+                continue
+                
+            line, _ = match
+            slope, intercept, is_horizontal = line
             
-        line, _ = match
-        slope, intercept, is_horizontal = line
-        
-        color = colors[i % len(colors)]
-        
-        # Calculate line endpoints
-        if is_horizontal:
-            x1, x2 = 0, new_width
-            y1 = int(slope * -left_ext + intercept) + top_ext
-            y2 = int(slope * (width + right_ext) + intercept) + top_ext
-        else:
-            y1, y2 = 0, new_height
-            x1 = int(slope * -top_ext + intercept) + left_ext
-            x2 = int(slope * (height + bottom_ext) + intercept) + left_ext
+            color = colors[i % len(colors)]
             
-        # Draw line
-        cv2.line(canvas, (x1, y1), (x2, y2), color, 2)
-        
-        # Draw label
-        mid_x, mid_y = (x1 + x2) // 2, (y1 + y2) // 2
-        label = f"B{i}"
-        if i == middle_idx:
-            label += "*"  # Mark middle line
-        cv2.putText(canvas, label, (mid_x, mid_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+            # Calculate line endpoints
+            if is_horizontal:
+                x1, x2 = 0, new_width
+                y1 = int(slope * -left_ext + intercept) + top_ext
+                y2 = int(slope * (width + right_ext) + intercept) + top_ext
+            else:
+                y1, y2 = 0, new_height
+                x1 = int(slope * -top_ext + intercept) + left_ext
+                x2 = int(slope * (height + bottom_ext) + intercept) + left_ext
+                
+            # Draw line
+            cv2.line(canvas, (x1, y1), (x2, y2), color, 2)
+            
+            # Draw label
+            mid_x, mid_y = (x1 + x2) // 2, (y1 + y2) // 2
+            label = f"B{i}"
+            if i == middle_idx:
+                label += "*"  # Mark middle line
+            cv2.putText(canvas, label, (mid_x, mid_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
     
-    # Draw intersections
-    for x, y in intersections:
-        adj_x, adj_y = x + left_ext, y + top_ext
-        cv2.circle(canvas, (adj_x, adj_y), 8, (255, 255, 255), -1)
-        cv2.circle(canvas, (adj_x, adj_y), 6, (100, 100, 200), -1)
+    # Draw intersections if available
+    if intersections:
+        for x, y in intersections:
+            adj_x, adj_y = x + left_ext, y + top_ext
+            cv2.circle(canvas, (adj_x, adj_y), 8, (255, 255, 255), -1)
+            cv2.circle(canvas, (adj_x, adj_y), 6, (100, 100, 200), -1)
+    
+    # Draw frame border to indicate original image boundaries
+    cv2.rectangle(canvas, (left_ext, top_ext), (left_ext + width, top_ext + height), (255, 255, 255), 2)
+    
+    # Add frame number at the top
+    if frame_number is not None:
+        cv2.putText(canvas, f"Frame: {frame_number}", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
     
     return canvas
-
 def process_single_frame(h5_file, frame_number, save_images=False):
     """Process a single frame with all optimizations"""
     # Load frame data
@@ -520,8 +541,8 @@ def process_single_frame(h5_file, frame_number, save_images=False):
     # Compute intersections
     intersections, extensions = compute_intersections(matched_lines, middle_idx, mask_shape)
     
-    # Create visualization
-    result_image = create_visualization(masks, matched_lines, middle_idx, intersections, extensions)
+    # Create visualization with frame number
+    result_image = create_visualization(masks, matched_lines, middle_idx, intersections, extensions, frame_number)
     
     # Save if requested
     if save_images and result_image is not None:
@@ -535,15 +556,36 @@ def process_single_frame(h5_file, frame_number, save_images=False):
         'middle_idx': middle_idx,
         'intersections': intersections
     }
-
 def process_batch(args):
     """Process a batch of frames - designed for multiprocessing"""
     batch, h5_file, save_images = args
     results = {}
     for frame in tqdm(batch, desc=f"Process {mp.current_process().name}", leave=False):
-        result = process_single_frame(h5_file, frame, save_images)
-        if result is not None:
-            results[frame] = result
+        try:
+            result = process_single_frame(h5_file, frame, save_images)
+            if result is not None:
+                results[frame] = result
+            else:
+                # Create a minimal result entry for failed frames to maintain continuity
+                results[frame] = {
+                    'frame': frame,
+                    'result_image': None,
+                    'keyway_corners': None,
+                    'matched_lines': [],
+                    'middle_idx': None,
+                    'intersections': []
+                }
+        except Exception as e:
+            print(f"Error processing frame {frame}: {str(e)}")
+            # Still add frame to results to maintain continuity
+            results[frame] = {
+                'frame': frame,
+                'result_image': None,
+                'keyway_corners': None,
+                'matched_lines': [],
+                'middle_idx': None,
+                'intersections': []
+            }
     return results
 
 def process_frames_parallel(h5_file, frame_numbers, n_processes=None, save_images=False):
@@ -570,7 +612,7 @@ def process_frames_parallel(h5_file, frame_numbers, n_processes=None, save_image
     return all_results
 
 def create_video_from_results(results, output_path, fps=10, frame_shape=None):
-    """Create video directly from processing results"""
+    """Create video directly from processing results with proper frame shape handling"""
     if not results:
         print("No results to create video from")
         return
@@ -578,31 +620,42 @@ def create_video_from_results(results, output_path, fps=10, frame_shape=None):
     # Get frame numbers and sort
     frame_numbers = sorted(list(results.keys()))
     
-    # Get frame shape from first result if not provided
-    if frame_shape is None and results[frame_numbers[0]]['result_image'] is not None:
-        frame_shape = results[frame_numbers[0]]['result_image'].shape
+    # Get frame shape from first result that has a valid image
+    result_frame_shape = None
+    for frame_num in frame_numbers:
+        if results[frame_num]['result_image'] is not None:
+            result_frame_shape = results[frame_num]['result_image'].shape
+            break
     
-    # Fallback shape
-    if frame_shape is None:
+    # Use detected shape from results if available
+    if result_frame_shape is not None:
+        frame_shape = result_frame_shape
+    # Fallback to provided frame shape
+    elif frame_shape is None:
         frame_shape = (480, 640, 3)
     
-    # Setup video writer
+    print(f"Using frame shape: {frame_shape} for video")
+    
+    # Setup video writer with the correct dimensions
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     writer = cv2.VideoWriter(output_path, fourcc, fps, (frame_shape[1], frame_shape[0]))
     
-    # Create blank frame
+    # Create blank frame for missing frames
     blank_frame = np.zeros(frame_shape, dtype=np.uint8)
     
     # Write frames
     for frame_num in tqdm(range(min(frame_numbers), max(frame_numbers) + 1), desc="Creating video"):
         if frame_num in results and results[frame_num]['result_image'] is not None:
-            writer.write(results[frame_num]['result_image'])
+            # Ensure frame has correct dimensions
+            frame = results[frame_num]['result_image']
+            if frame.shape != frame_shape:
+                frame = cv2.resize(frame, (frame_shape[1], frame_shape[0]))
+            writer.write(frame)
         else:
             writer.write(blank_frame)
     
     writer.release()
     print(f"Video saved to {output_path}")
-
 def process_h5_to_video(h5_file_path, output_video_path, start_frame=0, end_frame=None, fps=10, skip_frames=1, n_processes=None):
     """Main function to process H5 file and create video"""
     # Get frame information
