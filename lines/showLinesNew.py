@@ -172,6 +172,96 @@ def get_keyway_corners(mask):
     angles = np.arctan2(corners[:, 0] - center[0], corners[:, 1] - center[1])
     return corners[np.argsort(angles)]
 
+def identify_baseline(keyway_lines, free_throw_idx):
+    """Identify the baseline (line opposite to free throw line)"""
+    if free_throw_idx is None:
+        return None
+    
+    # The baseline is opposite to the free throw line (add 2 modulo 4)
+    baseline_idx = (free_throw_idx + 2) % 4
+    
+    return baseline_idx
+
+def match_boundary_lines_weighted(keyway_lines, boundary_segments, keyway_mask, baseline_idx=None):
+    """Match keyway lines to boundary segments with distance-weighted matching for baseline"""
+    if not boundary_segments or not keyway_lines:
+        return [None] * len(keyway_lines)
+    
+    matches = []
+    
+    # Calculate keyway center once
+    keyway_points = np.column_stack(np.where(keyway_mask))
+    if len(keyway_points) == 0:
+        return [None] * len(keyway_lines)
+    keyway_center = np.mean(keyway_points, axis=0)
+    
+    # Precompute boundary line fits
+    boundary_lines = []
+    for points in boundary_segments:
+        # Try horizontal fit first, then vertical
+        for is_horizontal in [True, False]:
+            line_fit = fit_line(points, is_horizontal)
+            if line_fit:
+                boundary_lines.append(((line_fit[0], line_fit[1], is_horizontal), points))
+                break
+    
+    # Match each keyway line to best boundary
+    for i, (keyway_line, keyway_points) in enumerate(keyway_lines):
+        slope, intercept, is_horizontal = keyway_line
+        best_match, best_score = None, -1
+        
+        # Calculate midpoint and outward vector
+        midpoint = np.mean(keyway_points, axis=0)
+        outward_vector = midpoint - keyway_center
+        if np.linalg.norm(outward_vector) > 0:
+            outward_vector = outward_vector / np.linalg.norm(outward_vector)
+        
+        # Find best matching boundary
+        for boundary_line, boundary_points in boundary_lines:
+            b_slope, b_intercept, b_is_horizontal = boundary_line
+            
+            # Skip if orientation doesn't match
+            if is_horizontal != b_is_horizontal or abs(slope - b_slope) > 0.5:
+                continue
+                
+            # Calculate vector to boundary midpoint
+            boundary_midpoint = np.mean(boundary_points, axis=0)
+            to_boundary_vector = boundary_midpoint - midpoint
+            
+            if np.linalg.norm(to_boundary_vector) > 0:
+                to_boundary_vector = to_boundary_vector / np.linalg.norm(to_boundary_vector)
+                
+                # Score based on direction alignment and distance
+                direction_score = np.dot(outward_vector, to_boundary_vector)
+                if direction_score <= 0:
+                    continue
+                    
+                # Calculate minimum distance efficiently
+                distances = cdist([midpoint], boundary_points)[0]
+                min_distance = np.min(distances)
+                
+                # Calculate boundary length
+                length = (np.max(boundary_points[:, 1]) - np.min(boundary_points[:, 1])) if is_horizontal else (np.max(boundary_points[:, 0]) - np.min(boundary_points[:, 0]))
+                
+                # Modify scoring for baseline - heavily weight distance
+                if i == baseline_idx:
+                    if min_distance <= 10:
+                        # Original scoring for other lines
+                        score = (0.2*length / (1 + 10*min_distance))
+                    else: 
+                        score = (length / (1 + min_distance)) * 10* direction_score
+                else:
+                    # Original scoring for other lines
+                    score = (length / (1 + min_distance)) * direction_score
+                
+                if score > best_score:
+                    best_score = score
+                    best_match = (boundary_line, boundary_points)
+        
+        matches.append(best_match)
+    
+    return matches
+
 def identify_free_throw_line(keyway_lines, three_mask):
     if not keyway_lines or three_mask is None or not np.any(three_mask):
         return None
@@ -454,7 +544,7 @@ def compute_intersections(matched_lines, middle_idx, shape):
     
     return intersections, (top_ext, right_ext, bottom_ext, left_ext)
 
-def create_visualization(masks, matched_lines, middle_idx, intersections, extensions, frame_number=None):
+def create_visualization(masks, matched_lines, middle_idx, intersections, extensions, frame_number=None, keyway_lines=None, free_throw_idx=None, baseline_idx=None):
     """Create visualization with boundary lines and intersections with automatic 40% expansion"""
     keyway_mask = masks.get(1, None)
     three_mask = masks.get(2, None)
@@ -498,7 +588,39 @@ def create_visualization(masks, matched_lines, middle_idx, intersections, extens
         canvas[extended_keyway] = (0, 255, 0)  # Green for keyway
         canvas[extended_three] = (0, 0, 255)   # Blue for three
     
-    # Line colors
+    # Draw keyway lines if available
+    if keyway_lines:
+        for i, (line, points) in enumerate(keyway_lines):
+            # Adjust points for extended canvas
+            adjusted_points = np.copy(points)
+            adjusted_points[:, 0] += top_ext  # Adjust y-coordinate
+            adjusted_points[:, 1] += left_ext  # Adjust x-coordinate
+            
+            # Select color based on line type
+            if i == baseline_idx:
+                color = (128, 0, 128)  # Purple for baseline
+                label = "K-Base"
+            elif i == free_throw_idx:
+                color = (255, 105, 180)  # Pink for free throw
+                label = "K-FT"
+            else:
+                color = (255, 165, 0)  # Orange for other keyway lines
+                label = f"K{i}"
+            
+            # Draw line between points
+            for j in range(len(adjusted_points)):
+                pt1 = (int(adjusted_points[j][1]), int(adjusted_points[j][0]))
+                pt2 = (int(adjusted_points[(j+1) % len(adjusted_points)][1]), 
+                       int(adjusted_points[(j+1) % len(adjusted_points)][0]))
+                cv2.line(canvas, pt1, pt2, color, 2)
+            
+            # Find midpoint for label
+            if len(adjusted_points) >= 2:
+                mid_x = int(np.mean(adjusted_points[:, 1]))
+                mid_y = int(np.mean(adjusted_points[:, 0]))
+                cv2.putText(canvas, label, (mid_x, mid_y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+    
+    # Line colors for boundary lines
     colors = [
         (255, 0, 0), (0, 0, 255), (255, 255, 0), (255, 0, 255), (0, 255, 255),
         (128, 0, 0), (0, 128, 0), (0, 0, 128), (128, 128, 0), (128, 0, 128)
@@ -562,7 +684,6 @@ def create_visualization(masks, matched_lines, middle_idx, intersections, extens
     
     return canvas
 
-
 def process_single_frame(h5_file, frame_number, save_images=False):
     """Process a single frame with all optimizations"""
     # Load frame data
@@ -596,14 +717,17 @@ def process_single_frame(h5_file, frame_number, save_images=False):
     # Identify free-throw line
     free_throw_idx = identify_free_throw_line(keyway_lines, three_mask)
     
+    # Identify baseline (K0)
+    baseline_idx = identify_baseline(keyway_lines, free_throw_idx)
+    
     # Filter keyway lines to keep only baseline and perpendicular lines
     filtered_keyway_lines = filter_keyway_lines(keyway_lines, free_throw_idx)
     
     # Process boundary segments
     boundary_segments = process_boundary_segments(boundary_mask)
     
-    # Match boundary lines with filtered keyway lines
-    matched_lines = match_boundary_lines(filtered_keyway_lines, boundary_segments, keyway_mask)
+    # Match boundary lines with filtered keyway lines, using weighted matching for baseline
+    matched_lines = match_boundary_lines_weighted(filtered_keyway_lines, boundary_segments, keyway_mask, baseline_idx)
     
     # Find middle line
     middle_idx = identify_middle_line(matched_lines, keyway_mask)
@@ -611,8 +735,11 @@ def process_single_frame(h5_file, frame_number, save_images=False):
     # Compute intersections
     intersections, extensions = compute_intersections(matched_lines, middle_idx, mask_shape)
     
-    # Create visualization with frame number
-    result_image = create_visualization(masks, matched_lines, middle_idx, intersections, extensions, frame_number)
+    # Create visualization with frame number, passing all keyway lines and indices
+    result_image = create_visualization(
+        masks, matched_lines, middle_idx, intersections, extensions, 
+        frame_number, keyway_lines, free_throw_idx, baseline_idx
+    )
     
     # Save if requested
     if save_images and result_image is not None:
@@ -623,11 +750,11 @@ def process_single_frame(h5_file, frame_number, save_images=False):
         'result_image': result_image,
         'keyway_corners': keyway_corners,
         'free_throw_idx': free_throw_idx,
+        'baseline_idx': baseline_idx,
         'matched_lines': matched_lines,
         'middle_idx': middle_idx,
         'intersections': intersections
     }
-
 def process_batch(args):
     """Process a batch of frames - designed for multiprocessing"""
     batch, h5_file, save_images = args
