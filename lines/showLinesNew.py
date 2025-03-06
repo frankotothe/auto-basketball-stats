@@ -113,7 +113,7 @@ def detect_corners_improved(points, min_angle=20, min_dist=15):
         return [points]
         
     sorted_points = sort_points_vectorized(points)
-    window_size, stride = 25, 4  # Increased stride for efficiency
+    window_size, stride = 25, 2  # Increased stride for efficiency
     
     corners = []
     
@@ -182,8 +182,8 @@ def identify_baseline(keyway_lines, free_throw_idx):
     
     return baseline_idx
 
-def match_boundary_lines_weighted(keyway_lines, boundary_segments, keyway_mask, baseline_idx=None):
-    """Match keyway lines to boundary segments with distance-weighted matching for baseline"""
+def match_boundary_lines(keyway_lines, boundary_segments, keyway_mask, baseline_idx=None):
+    """Match keyway lines to boundary segments with the baseline using itself as its match"""
     if not boundary_segments or not keyway_lines:
         return [None] * len(keyway_lines)
     
@@ -193,6 +193,7 @@ def match_boundary_lines_weighted(keyway_lines, boundary_segments, keyway_mask, 
     keyway_points = np.column_stack(np.where(keyway_mask))
     if len(keyway_points) == 0:
         return [None] * len(keyway_lines)
+    
     keyway_center = np.mean(keyway_points, axis=0)
     
     # Precompute boundary line fits
@@ -207,6 +208,12 @@ def match_boundary_lines_weighted(keyway_lines, boundary_segments, keyway_mask, 
     
     # Match each keyway line to best boundary
     for i, (keyway_line, keyway_points) in enumerate(keyway_lines):
+        # For baseline, use itself as its own match
+        if i == baseline_idx:
+            # Create a match using the baseline's own parameters
+            matches.append(((keyway_line[0], keyway_line[1], keyway_line[2]), keyway_points))
+            continue
+            
         slope, intercept, is_horizontal = keyway_line
         best_match, best_score = None, -1
         
@@ -223,45 +230,35 @@ def match_boundary_lines_weighted(keyway_lines, boundary_segments, keyway_mask, 
             # Skip if orientation doesn't match
             if is_horizontal != b_is_horizontal or abs(slope - b_slope) > 0.5:
                 continue
-                
+            
             # Calculate vector to boundary midpoint
             boundary_midpoint = np.mean(boundary_points, axis=0)
             to_boundary_vector = boundary_midpoint - midpoint
-            
             if np.linalg.norm(to_boundary_vector) > 0:
                 to_boundary_vector = to_boundary_vector / np.linalg.norm(to_boundary_vector)
-                
-                # Score based on direction alignment and distance
-                direction_score = np.dot(outward_vector, to_boundary_vector)
-                if direction_score <= 0:
-                    continue
-                    
-                # Calculate minimum distance efficiently
-                distances = cdist([midpoint], boundary_points)[0]
-                min_distance = np.min(distances)
-                
-                # Calculate boundary length
-                length = (np.max(boundary_points[:, 1]) - np.min(boundary_points[:, 1])) if is_horizontal else (np.max(boundary_points[:, 0]) - np.min(boundary_points[:, 0]))
-                
-                # Modify scoring for baseline - heavily weight distance
-                if i == baseline_idx:
-                    if min_distance <= 10:
-                        # Original scoring for other lines
-                        score = (0.2*length / (1 + 10*min_distance))
-                    else: 
-                        score = (length / (1 + min_distance)) * 10* direction_score
-                else:
-                    # Original scoring for other lines
-                    score = (length / (1 + min_distance)) * direction_score
-                
-                if score > best_score:
-                    best_score = score
-                    best_match = (boundary_line, boundary_points)
+            
+            # Score based on direction alignment and distance
+            direction_score = np.dot(outward_vector, to_boundary_vector)
+            if direction_score <= 0:
+                continue
+            
+            # Calculate minimum distance efficiently
+            distances = cdist([midpoint], boundary_points)[0]
+            min_distance = np.min(distances)
+            
+            # Calculate boundary length
+            length = (np.max(boundary_points[:, 1]) - np.min(boundary_points[:, 1])) if is_horizontal else (np.max(boundary_points[:, 0]) - np.min(boundary_points[:, 0]))
+            
+            # Standard scoring for all non-baseline lines
+            score = (0.1*length / (1 + min_distance)) * 3*direction_score
+            
+            if score > best_score:
+                best_score = score
+                best_match = (boundary_line, boundary_points)
         
         matches.append(best_match)
     
     return matches
-
 def identify_free_throw_line(keyway_lines, three_mask):
     if not keyway_lines or three_mask is None or not np.any(three_mask):
         return None
@@ -378,78 +375,6 @@ def process_boundary_segments(boundary_mask, min_cluster_size=10):
         return [seg for seg in segments if len(seg) >= min_cluster_size]
     except:
         return []
-
-def match_boundary_lines(keyway_lines, boundary_segments, keyway_mask):
-    """Match keyway lines to boundary segments with improved efficiency"""
-    if not boundary_segments or not keyway_lines:
-        return [None] * len(keyway_lines)
-    
-    matches = []
-    
-    # Calculate keyway center once
-    keyway_points = np.column_stack(np.where(keyway_mask))
-    if len(keyway_points) == 0:
-        return [None] * len(keyway_lines)
-    keyway_center = np.mean(keyway_points, axis=0)
-    
-    # Precompute boundary line fits
-    boundary_lines = []
-    for points in boundary_segments:
-        # Try horizontal fit first, then vertical
-        for is_horizontal in [True, False]:
-            line_fit = fit_line(points, is_horizontal)
-            if line_fit:
-                boundary_lines.append(((line_fit[0], line_fit[1], is_horizontal), points))
-                break
-    
-    # Match each keyway line to best boundary
-    for keyway_line, keyway_points in keyway_lines:
-        slope, intercept, is_horizontal = keyway_line
-        best_match, best_score = None, -1
-        
-        # Calculate midpoint and outward vector
-        midpoint = np.mean(keyway_points, axis=0)
-        outward_vector = midpoint - keyway_center
-        if np.linalg.norm(outward_vector) > 0:
-            outward_vector = outward_vector / np.linalg.norm(outward_vector)
-        
-        # Find best matching boundary
-        for boundary_line, boundary_points in boundary_lines:
-            b_slope, b_intercept, b_is_horizontal = boundary_line
-            
-            # Skip if orientation doesn't match
-            if is_horizontal != b_is_horizontal or abs(slope - b_slope) > 0.5:
-                continue
-                
-            # Calculate vector to boundary midpoint
-            boundary_midpoint = np.mean(boundary_points, axis=0)
-            to_boundary_vector = boundary_midpoint - midpoint
-            
-            if np.linalg.norm(to_boundary_vector) > 0:
-                to_boundary_vector = to_boundary_vector / np.linalg.norm(to_boundary_vector)
-                
-                # Score based on direction alignment and distance
-                direction_score = np.dot(outward_vector, to_boundary_vector)
-                if direction_score <= 0:
-                    continue
-                    
-                # Calculate minimum distance efficiently
-                distances = cdist([midpoint], boundary_points)[0]
-                min_distance = np.min(distances)
-                
-                # Calculate boundary length
-                length = (np.max(boundary_points[:, 1]) - np.min(boundary_points[:, 1])) if is_horizontal else (np.max(boundary_points[:, 0]) - np.min(boundary_points[:, 0]))
-                
-                # Final score
-                score = (length / (1 + min_distance)) * direction_score
-                
-                if score > best_score:
-                    best_score = score
-                    best_match = (boundary_line, boundary_points)
-        
-        matches.append(best_match)
-    
-    return matches
 
 def identify_middle_line(matched_lines, keyway_mask):
     """Find the middle line from matched boundary lines"""
@@ -599,10 +524,10 @@ def create_visualization(masks, matched_lines, middle_idx, intersections, extens
             # Select color based on line type
             if i == baseline_idx:
                 color = (128, 0, 128)  # Purple for baseline
-                label = "K-Base"
+                label = f"K-Base{i}"
             elif i == free_throw_idx:
                 color = (255, 105, 180)  # Pink for free throw
-                label = "K-FT"
+                label = f"K-FT{i}"
             else:
                 color = (255, 165, 0)  # Orange for other keyway lines
                 label = f"K{i}"
@@ -684,6 +609,228 @@ def create_visualization(masks, matched_lines, middle_idx, intersections, extens
     
     return canvas
 
+def group_intersection_points(results, h5_file_path=None):
+    from scipy.spatial.distance import pdist, squareform
+    import numpy as np
+    import h5py
+    
+    # Check if we have the h5 file path
+    if h5_file_path is None:
+        print("Warning: h5_file_path not provided, cannot verify boundary object count")
+        # Continue with the original filtering
+        valid_frames = {
+            frame: result for frame, result in results.items() 
+            if (result.get('keyway_corners') is not None and 
+                result.get('intersections') and 
+                len(result.get('intersections')) > 0)
+        }
+    else:
+        # Check boundary object count for each frame
+        valid_frames = {}
+        with h5py.File(h5_file_path, 'r') as f:
+            for frame, result in results.items():
+                # Skip frames without keyway corners or intersections
+                if (result.get('keyway_corners') is None or 
+                    not result.get('intersections') or 
+                    len(result.get('intersections')) == 0):
+                    continue
+                
+                # Check if frame has at least 2 boundary objects
+                frame_key = f'frame_{frame}'
+                if 'frames' in f and frame_key in f['frames']:
+                    frame_data = f['frames'][frame_key]
+                    
+                    # Count boundary objects (class_id 0)
+                    boundary_count = 0
+                    for detection_key in frame_data.keys():
+                        detection = frame_data[detection_key]
+                        if 'class_id' in detection.attrs and detection.attrs['class_id'] == 0:
+                            boundary_count += 1
+                    
+                    # Only add frames with at least 2 boundary objects
+                    if boundary_count >= 2:
+                        valid_frames[frame] = result
+    
+    # Extract keyway centers and intersections
+    frame_data = []
+    for frame, result in valid_frames.items():
+        keyway_center = np.mean(result['keyway_corners'], axis=0)
+        intersections = np.array(result['intersections'])
+        
+        # Handle cases with fewer than 2 intersections
+        first_point = intersections[0] if len(intersections) > 0 else None
+        second_point = intersections[1] if len(intersections) > 1 else None
+        
+        frame_data.append({
+            'frame': frame,
+            'keyway_center': keyway_center,
+            'first_point': first_point,
+            'second_point': second_point
+        })
+    
+    # Remove frames without at least one valid point
+    frame_data = [fd for fd in frame_data if fd['first_point'] is not None]
+    
+    # If no valid frames, return empty results
+    if not frame_data:
+        return results, {}
+    
+    # Compute pairwise distances between keyway centers
+    keyway_centers = np.array([fd['keyway_center'] for fd in frame_data])
+    keyway_distances = squareform(pdist(keyway_centers))
+    
+    # Group frames with similar keyway positions
+    frame_groups = []
+    grouped_frames = set()
+    
+    for i in range(len(frame_data)):
+        if i in grouped_frames:
+            continue
+        
+        group = [frame_data[i]]
+        grouped_frames.add(i)
+        
+        for j in range(i+1, len(frame_data)):
+            if j in grouped_frames:
+                continue
+            
+            # Check keyway center similarity
+            if keyway_distances[i, j] <= 20:  # Adjust threshold as needed
+                group.append(frame_data[j])
+                grouped_frames.add(j)
+        
+        # Only keep groups with more than one frame
+        if len(group) > 1:
+            frame_groups.append(group)
+    
+    # Prepare grouped results
+    grouped_results = {}
+    
+    for group in frame_groups:
+        # Separate first and second points
+        first_points = [fd['first_point'] for fd in group if fd['first_point'] is not None]
+        second_points = [fd['second_point'] for fd in group if fd['second_point'] is not None]
+        
+        # Compute robust average for each point set
+        avg_first_point = np.median(first_points, axis=0) if first_points else None
+        avg_second_point = np.median(second_points, axis=0) if second_points else None
+        
+        # Create group metadata
+        group_metadata = {
+            'frames': [fd['frame'] for fd in group],
+            'frame_count': len(group),
+            'avg_first_point': avg_first_point.tolist() if avg_first_point is not None else None,
+            'avg_second_point': avg_second_point.tolist() if avg_second_point is not None else None,
+            'raw_first_points': [p.tolist() for p in first_points],
+            'raw_second_points': [p.tolist() for p in second_points]
+        }
+        
+        # Add metadata for each frame in the group
+        for fd in group:
+            grouped_results[fd['frame']] = group_metadata
+    
+    return results, grouped_results
+def create_comprehensive_intersections_video(h5_file_path, output_video_path, start_frame=0, end_frame=None, fps=10, skip_frames=1, n_processes=None):
+    frame_info = get_frame_info(h5_file_path)
+    
+    if not frame_info['valid_frames']:
+        print("No valid frames found in H5 file")
+        return
+    
+    valid_frames = frame_info['valid_frames']
+    
+    if end_frame is None or end_frame >= len(valid_frames):
+        end_frame = len(valid_frames) - 1
+    
+    frames_to_process = valid_frames[start_frame:end_frame+1:skip_frames]
+    
+    results = process_frames_parallel(h5_file_path, frames_to_process, n_processes)
+    
+    _, grouped_results = group_intersection_points(results, h5_file_path)
+    
+    frame_shape = frame_info['shape']
+    if frame_shape is None:
+        frame_shape = (480, 640)
+    
+    top_ext = int(frame_shape[0] * 0.4)
+    right_ext = int(frame_shape[1] * 0.4)
+    bottom_ext = int(frame_shape[0] * 0.4)
+    left_ext = int(frame_shape[1] * 0.4)
+    
+    new_height = frame_shape[0] + top_ext + bottom_ext
+    new_width = frame_shape[1] + left_ext + right_ext
+    
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    writer = cv2.VideoWriter(output_video_path, fourcc, fps, (new_width, new_height), isColor=True)
+    
+    blank_frame = np.zeros((new_height, new_width, 3), dtype=np.uint8)
+    
+    for frame_number in tqdm(range(min(frames_to_process), max(frames_to_process) + 1), desc="Creating Intersections Video"):
+        frame = blank_frame.copy()
+        
+        frame_data = load_frame_data(h5_file_path, frame_number)
+        
+        if frame_data and 'masks' in frame_data:
+            masks = frame_data['masks']
+            
+            if 1 in masks:
+                keyway_mask = masks[1]
+                extended_keyway = np.zeros((new_height, new_width), dtype=bool)
+                extended_keyway[top_ext:top_ext+frame_shape[0], left_ext:left_ext+frame_shape[1]] = keyway_mask
+                frame[extended_keyway] = [0, 255, 0]
+            
+            if 2 in masks:
+                three_mask = masks[2]
+                extended_three = np.zeros((new_height, new_width), dtype=bool)
+                extended_three[top_ext:top_ext+frame_shape[0], left_ext:left_ext+frame_shape[1]] = three_mask
+                frame[extended_three] = [255, 0, 0]
+        
+        frame_group_result = grouped_results.get(frame_number, {})
+        
+        frame_result = results.get(frame_number, {})
+        intersections = frame_result.get('intersections', [])
+        
+        if intersections:
+            for x, y in intersections:
+                adj_x, adj_y = x + left_ext, y + top_ext
+                cv2.circle(frame, (adj_x, adj_y), 6, (100, 100, 100), -1)
+        
+        # Robust check for both first and second points
+        first_point = frame_group_result.get('avg_first_point')
+        second_point = frame_group_result.get('avg_second_point')
+        
+        if first_point is not None and second_point is not None:
+            # Ensure points are lists or numpy arrays with at least 2 elements
+            if len(first_point) >= 2 and len(second_point) >= 2:
+                adj_x1, adj_y1 = int(first_point[0]) + left_ext, int(first_point[1]) + top_ext
+                adj_x2, adj_y2 = int(second_point[0]) + left_ext, int(second_point[1]) + top_ext
+                
+                cv2.circle(frame, (adj_x1, adj_y1), 12, (255, 255, 255), -1)
+                cv2.circle(frame, (adj_x1, adj_y1), 10, (0, 0, 255), -1)
+                
+                cv2.circle(frame, (adj_x2, adj_y2), 12, (255, 255, 255), -1)
+                cv2.circle(frame, (adj_x2, adj_y2), 10, (0, 255, 0), -1)
+                
+                text_info = (
+                    f"Frames: {frame_group_result.get('frame_count', 1)}, "
+                    f"Group Points: {len(frame_group_result.get('raw_first_points', []))}"
+                )
+                cv2.putText(frame, text_info, (adj_x1 + 20, adj_y1), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        
+        cv2.rectangle(frame, 
+                      (left_ext, top_ext), 
+                      (left_ext + frame_shape[1], top_ext + frame_shape[0]), 
+                      (255, 255, 255), 2)
+        
+        cv2.putText(frame, f"Frame: {frame_number}", (20, 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+        
+        writer.write(frame)
+    
+    writer.release()
+    print(f"Intersections video saved to {output_video_path}")
+
 def process_single_frame(h5_file, frame_number, save_images=False):
     """Process a single frame with all optimizations"""
     # Load frame data
@@ -727,10 +874,10 @@ def process_single_frame(h5_file, frame_number, save_images=False):
     boundary_segments = process_boundary_segments(boundary_mask)
     
     # Match boundary lines with filtered keyway lines, using weighted matching for baseline
-    matched_lines = match_boundary_lines_weighted(filtered_keyway_lines, boundary_segments, keyway_mask, baseline_idx)
+    matched_lines = match_boundary_lines(filtered_keyway_lines, boundary_segments, keyway_mask, baseline_idx)
     
     # Find middle line
-    middle_idx = identify_middle_line(matched_lines, keyway_mask)
+    middle_idx = baseline_idx
     
     # Compute intersections
     intersections, extensions = compute_intersections(matched_lines, middle_idx, mask_shape)
@@ -855,6 +1002,7 @@ def create_video_from_results(results, output_path, fps=10, frame_shape=None):
     
     writer.release()
     print(f"Video saved to {output_path}")
+
 def process_h5_to_video(h5_file_path, output_video_path, start_frame=0, end_frame=None, fps=10, skip_frames=1, n_processes=None):
     """Main function to process H5 file and create video"""
     # Get frame information
@@ -883,9 +1031,15 @@ def process_h5_to_video(h5_file_path, output_video_path, start_frame=0, end_fram
     print(f"Processed {len(results)} frames in {processing_time:.2f} seconds")
     print(f"Average time per frame: {processing_time/len(frames_to_process):.4f} seconds")
     
+    # Group intersection points
+    processed_results, grouped_results = group_intersection_points(results, h5_file_path)
+    
     # Create video
-    create_video_from_results(results, output_video_path, fps, 
+    create_video_from_results(processed_results, output_video_path, fps, 
                              frame_shape=frame_info['shape'] and (frame_info['shape'][0], frame_info['shape'][1], 3))
+    
+    return processed_results, grouped_results
+
 
 if __name__ == "__main__":
     import argparse
@@ -893,15 +1047,18 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Process H5 file with optimized boundary line detection')
     parser.add_argument('h5_file', type=str, help='Path to the H5 file')
     parser.add_argument('--output', type=str, default='optimized_boundary_lines.mp4', help='Output video path')
+    parser.add_argument('--intersections_output', type=str, default='all_intersections.mp4', help='Intersections video path')
     parser.add_argument('--start', type=int, default=0, help='Start frame index')
     parser.add_argument('--end', type=int, default=None, help='End frame index')
     parser.add_argument('--fps', type=int, default=10, help='Frames per second for output video')
     parser.add_argument('--skip', type=int, default=1, help='Process every n-th frame')
     parser.add_argument('--processes', type=int, default=None, help='Number of parallel processes to use')
+    parser.add_argument('--create_intersections_video', action='store_true', help='Create intersections video')
     
     args = parser.parse_args()
     
-    process_h5_to_video(
+    # Process main boundary lines video
+    results, grouped_results = process_h5_to_video(
         args.h5_file, 
         args.output, 
         start_frame=args.start, 
@@ -910,3 +1067,14 @@ if __name__ == "__main__":
         skip_frames=args.skip,
         n_processes=args.processes
     )
+    
+    # Optionally create intersections video
+    if args.create_intersections_video:
+        create_comprehensive_intersections_video(
+            args.h5_file,
+            args.intersections_output,
+            start_frame=args.start,
+            end_frame=args.end,
+            fps=args.fps,
+            skip_frames=args.skip
+        )
