@@ -111,8 +111,51 @@ def process_segment(segment_tuple: Tuple[str, int, int],
     with open(config_path, 'w') as f:
         json.dump(config, f)
     
-    # Run the original script with modified config
-    subprocess.run(["python", script_path, "--config", config_path], check=True)
+    try:
+        # Run the original script with modified config
+        subprocess.run(["python", script_path, "--config", config_path], check=True)
+    except Exception as e:
+        print(f"Warning: Failed to process segment {segment_name}: {e}")
+        
+        # Check if output files exist, create blank ones if they don't
+        cap = cv2.VideoCapture(segment_path)
+        if cap.isOpened():
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            cap.release()
+            
+            # Create blank frames for each output type
+            for output_path in [output_original, output_masks, output_labels]:
+                if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
+                    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                    writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+                    
+                    # Create a blank frame
+                    if output_path == output_masks:
+                        blank_frame = np.zeros((height, width, 3), dtype=np.uint8)  # Black for masks
+                    elif output_path == output_labels:
+                        blank_frame = np.zeros((height, width, 3), dtype=np.uint8)  # Black for labels
+                    else:  # For original, use a gray frame
+                        blank_frame = np.ones((height, width, 3), dtype=np.uint8) * 128  # Gray for original
+                    
+                    # Write blank frames
+                    for _ in range(frame_count):
+                        writer.write(blank_frame)
+                    writer.release()
+            
+            # Create empty H5 file if needed
+            if not os.path.exists(tracking_h5_path) or os.path.getsize(tracking_h5_path) == 0:
+                with h5py.File(tracking_h5_path, 'w') as h5_file:
+                    h5_file.attrs['fps'] = fps
+                    h5_file.attrs['width'] = width
+                    h5_file.attrs['height'] = height
+                    h5_file.attrs['frames'] = frame_count
+                    # Add empty frame groups
+                    for i in range(frame_count):
+                        frame_name = f"frame_{i:05d}"
+                        h5_file.create_group(frame_name)
     
     # Return information about the processed segment
     return {
@@ -222,32 +265,75 @@ def main(video_path: str,
         num_segments: Number of segments (used if split_points not provided)
         max_workers: Maximum number of parallel workers
     """
+    segments = []
     try:
-        # Split video into segments
-        segments = split_video_segments(video_path, split_points, num_segments)
+        # Create checkpoint directory to track progress
+        checkpoint_dir = os.path.join(os.path.dirname(output_prefix), "checkpoints")
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        checkpoint_file = os.path.join(checkpoint_dir, "progress.json")
+        
+        # Check if we're resuming from a previous run
+        if os.path.exists(checkpoint_file):
+            with open(checkpoint_file, 'r') as f:
+                checkpoint_data = json.load(f)
+                
+            segments = checkpoint_data.get("segments", [])
+            segment_results = checkpoint_data.get("completed_segments", [])
+            unique_id_counter = checkpoint_data.get("unique_id_counter", 0)
+            remaining_segments = [(s[0], s[1], s[2]) for s in checkpoint_data.get("remaining_segments", [])]
+        else:
+            # Split video into segments
+            segments = split_video_segments(video_path, split_points, num_segments)
+            segment_results = []
+            unique_id_counter = 0
+            remaining_segments = segments.copy()
+            
+            # Save initial checkpoint
+            with open(checkpoint_file, 'w') as f:
+                json.dump({
+                    "segments": segments,
+                    "completed_segments": segment_results,
+                    "unique_id_counter": unique_id_counter,
+                    "remaining_segments": remaining_segments
+                }, f)
+        
+        # Print progress info
+        print(f"Processing {len(remaining_segments)} segments out of {len(segments)} total segments")
         
         # Process segments in parallel
-        segment_results = []
-        unique_id_counter = 0
-        
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            # Submit all segment jobs
-            futures = {}
-            for segment in segments:
-                future = executor.submit(
-                    process_segment, segment, unique_id_counter, script_path
-                )
-                futures[future] = segment
-                # Estimate unique IDs needed for next segment
-                _, start, end = segment
-                unique_id_counter += (end - start) // 5  # Conservative estimate for unique IDs
-            
-            # Process results as they complete
-            for future in as_completed(futures):
-                segment_result = future.result()
-                segment_results.append(segment_result)
+        if remaining_segments:
+            with ProcessPoolExecutor(max_workers=max_workers) as executor:
+                # Submit remaining segment jobs
+                futures = {}
+                for segment in remaining_segments:
+                    future = executor.submit(
+                        process_segment, segment, unique_id_counter, script_path
+                    )
+                    futures[future] = segment
+                    # Estimate unique IDs needed for next segment
+                    _, start, end = segment
+                    unique_id_counter += (end - start) // 5  # Conservative estimate for unique IDs
+                
+                # Process results as they complete
+                completed_count = 0
+                total_count = len(futures)
+                for future in as_completed(futures):
+                    segment_result = future.result()
+                    segment_results.append(segment_result)
+                    completed_count += 1
+                    
+                    # Update checkpoint after each segment is processed
+                    print(f"Progress: {completed_count}/{total_count} segments completed")
+                    with open(checkpoint_file, 'w') as f:
+                        json.dump({
+                            "segments": segments,
+                            "completed_segments": segment_results,
+                            "unique_id_counter": unique_id_counter,
+                            "remaining_segments": [s for s in remaining_segments if s != futures[future]]
+                        }, f)
         
         # Combine results
+        print("All segments processed. Combining results...")
         combine_videos(segment_results, output_prefix)
         combine_h5_files(segment_results, f"{output_prefix}_tracking.h5")
         
@@ -257,15 +343,22 @@ def main(video_path: str,
         print(f"  - {output_prefix}_labels.mp4")
         print(f"  - {output_prefix}_tracking.h5")
         
+        # Clean up checkpoint file after successful completion
+        if os.path.exists(checkpoint_file):
+            os.remove(checkpoint_file)
+            
     except Exception as e:
         print(f"Error in parallel processing: {e}")
+        print("You can restart the script to continue from the last checkpoint.")
         raise
     finally:
-        # Clean up temp files (comment out during testing if needed)
-        for segment_path, _, _ in segments:
-            temp_dir = os.path.dirname(segment_path)
-            if os.path.exists(temp_dir):
-                shutil.rmtree(temp_dir)
+        # Keep temp files if there was an error, to allow resuming
+        if len(segments) > 0 and 'segment_results' in locals() and len(segment_results) == len(segments):
+            # Only clean up if all segments were processed successfully
+            for segment_path, _, _ in segments:
+                temp_dir = os.path.dirname(segment_path)
+                if os.path.exists(temp_dir):
+                    shutil.rmtree(temp_dir)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Process video in parallel segments")

@@ -68,7 +68,10 @@ class ObjectTracker:
         self.centroid_history = []
         self.max_history = 3
         # Add minimum area threshold as percentage of total mask area
-        self.min_component_area_ratio = 0.2  # Components smaller than 20% of largest will be removed
+        self.min_component_area_ratio = 0.15  # Components smaller than 20% of largest will be removed
+        # Add tracking for frames without high confidence YOLO detection
+        self.frames_without_detection = 0
+        self.yolo_detection_threshold = 0.25  # 25% accuracy threshold
 
     def update_score(self, score):
         """Update tracker status based on score"""
@@ -101,9 +104,10 @@ class ObjectTracker:
                     # Keep component if it's large enough relative to the largest component
                     if area >= largest_area * self.min_component_area_ratio:
                         cleaned_mask = np.logical_or(cleaned_mask, labels == label_idx)
+                    """
                     else:
                         print(f"Removing small component (area: {area}) from {self.obj_key}")
-                
+                    """
                 # Update mask to cleaned version
                 mask = cleaned_mask
 
@@ -169,7 +173,22 @@ class ObjectTracker:
             self.last_mask = None
             self.mask_area = 0
             return False
+            
+    def increment_no_detection(self):
+        """Increment counter for frames without high-confidence YOLO detection"""
+        self.frames_without_detection += 1
         
+        # Check if we've reached the threshold of 8 frames without detection
+        if self.frames_without_detection >= 12:
+            print(f"Deactivating {self.obj_key} due to {self.frames_without_detection} frames without YOLO detection above {self.yolo_detection_threshold*100}% confidence")
+            self.is_active = False
+            return False
+        return True
+        
+    def reset_no_detection(self):
+        """Reset counter when a high-confidence detection is found"""
+        self.frames_without_detection = 0
+
 class ReintroductionTracker:
     def __init__(self, confidence_threshold):
         self.consecutive_detections = []
@@ -593,6 +612,45 @@ def main():
                 # Get pre-computed detections for current frame
                 detected_players, detected_ball, detected_rim = find_objects_in_frame(frame_idx, detection_store)
                 
+                # Update YOLO detection tracking for existing trackers
+                for obj_key, tracker in list(trackers.items()):
+                    if not tracker.is_active:
+                        continue
+                        
+                    # Check if this object has a high-confidence detection in this frame
+                    high_confidence_detection = False
+                    
+                    # For players
+                    if obj_key.startswith("player_") and detected_players:
+                        # Find if this player has a matching detection
+                        if tracker.last_centroid is not None:
+                            for player_detection in detected_players:
+                                if 'centroid' in player_detection and 'confidence' in player_detection:
+                                    dist = calculate_centroid_distance(tracker.last_centroid, player_detection['centroid'])
+                                    if dist < CENTROID_DISTANCE_THRESHOLD and player_detection['confidence'] > tracker.yolo_detection_threshold:
+                                        high_confidence_detection = True
+                                        break
+                    
+                    # For ball
+                    elif obj_key == "ball" and detected_ball:
+                        if tracker.last_centroid is not None and 'centroid' in detected_ball and 'confidence' in detected_ball:
+                            dist = calculate_centroid_distance(tracker.last_centroid, detected_ball['centroid'])
+                            if dist < CENTROID_DISTANCE_THRESHOLD and detected_ball['confidence'] > tracker.yolo_detection_threshold:
+                                high_confidence_detection = True
+                    
+                    # For rim
+                    elif obj_key == "rim" and detected_rim:
+                        if tracker.last_centroid is not None and 'centroid' in detected_rim and 'confidence' in detected_rim:
+                            dist = calculate_centroid_distance(tracker.last_centroid, detected_rim['centroid'])
+                            if dist < CENTROID_DISTANCE_THRESHOLD and detected_rim['confidence'] > tracker.yolo_detection_threshold:
+                                high_confidence_detection = True
+                    
+                    # Update the no-detection counter or reset it
+                    if high_confidence_detection:
+                        tracker.reset_no_detection()
+                    else:
+                        tracker.increment_no_detection()
+                
                 # Handle rim detection and tracking
                 if "rim" not in trackers or not trackers["rim"].is_active:
                     rim_reintroduction.add_detection(detected_rim)
@@ -765,6 +823,7 @@ def main():
         print(f"Mask video saved to: {output_masks}")
         print(f"Labels video saved to: {output_labels}")
         print(f"Tracking data saved to: {tracking_h5_path}")
+
 
 if __name__ == "__main__":
     main()

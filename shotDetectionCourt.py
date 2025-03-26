@@ -1098,13 +1098,582 @@ def check_sequence_validity(sequence):
         return True
     
     return False
+def extract_team_colors(player_h5_path, video_path, min_players=5, frame_sample_interval=30):
+    """
+    Extract team colors from player masks and video frames.
+    
+    Args:
+        player_h5_path: Path to the player tracking h5 file
+        video_path: Path to the original video file
+        min_players: Minimum number of players needed for reliable clustering
+        frame_sample_interval: Sample every Nth frame for performance
+        
+    Returns:
+        team_assignments: Dictionary mapping object_ids to team numbers (0 or 1)
+        team_colors: Representative colors for each team (BGR format)
+    """
+    # Open video file
+    video_capture = cv2.VideoCapture(str(video_path))
+    if not video_capture.isOpened():
+        print(f"Error opening video file: {video_path}")
+        return {}, [(255, 255, 255), (0, 0, 0)]  # Default colors if video can't be opened
+    
+    video_width = int(video_capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+    video_height = int(video_capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    
+    # Color samples from all players
+    all_color_samples = []  # List of (object_id, average_color) tuples
+    
+    try:
+        with h5py.File(player_h5_path, 'r') as h5_file:
+            # Get frame keys
+            frame_keys = sorted([k for k in h5_file.keys() if k.startswith('frame_')])
+            
+            # Sample frames at intervals for efficiency
+            sampled_frames = frame_keys[::frame_sample_interval]
+            
+            for frame_key in sampled_frames:
+                frame_idx = int(frame_key.split('_')[1])
+                
+                # Set video to this frame
+                video_capture.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                ret, video_frame = video_capture.read()
+                
+                if not ret:
+                    print(f"Failed to read frame {frame_idx} from video")
+                    continue
+                
+                # Get h5 frame data
+                frame_group = h5_file[frame_key]
+                
+                # Process each player in this frame
+                for obj_key in frame_group.keys():
+                    if not obj_key.startswith('player'):
+                        continue
+                    
+                    # Get player object_id
+                    player_obj = frame_group[obj_key]
+                    player_attrs = dict(player_obj.attrs)
+                    object_id = player_attrs.get('object_id', None)
+                    
+                    if object_id is None:
+                        continue
+                    
+                    # Get player mask
+                    mask = get_mask_from_player_h5(frame_group, obj_key)
+                    if mask is None or not np.any(mask):
+                        continue
+                    
+                    # Need to scale mask to match video frame dimensions
+                    if mask.shape[0] != video_height or mask.shape[1] != video_width:
+                        scale_x = video_width / mask.shape[1]
+                        scale_y = video_height / mask.shape[0]
+                        
+                        # Create scaled mask
+                        scaled_mask = cv2.resize(
+                            mask.astype(np.uint8),
+                            (video_width, video_height)
+                        ).astype(bool)
+                    else:
+                        scaled_mask = mask
+                    
+                    # Extract jersey area (mid-upper part of the player mask)
+                    jersey_mask = extract_jersey_region(scaled_mask)
+                    
+                    if np.sum(jersey_mask) > 10:  # Ensure we have enough pixels for a good sample
+                        # Extract colors from the video frame using the jersey mask
+                        jersey_colors = video_frame[jersey_mask]
+                        
+                        # Calculate average BGR color
+                        avg_color = np.mean(jersey_colors, axis=0)
+                        
+                        # Store with object_id
+                        all_color_samples.append((object_id, avg_color))
+    
+    except Exception as e:
+        print(f"Error extracting team colors: {e}")
+        return {}, [(255, 255, 255), (0, 0, 0)]
+    
+    finally:
+        video_capture.release()
+    
+    # Check if we have enough samples for clustering
+    if len(all_color_samples) < min_players:
+        print(f"Not enough color samples for reliable clustering: {len(all_color_samples)}")
+        return {}, [(255, 255, 255), (0, 0, 0)]
+    
+    # Group samples by object_id and average colors per player
+    player_colors = {}
+    for object_id, color in all_color_samples:
+        if object_id not in player_colors:
+            player_colors[object_id] = []
+        player_colors[object_id].append(color)
+    
+    # Calculate average color per player
+    player_avg_colors = {}
+    for object_id, colors in player_colors.items():
+        player_avg_colors[object_id] = np.mean(colors, axis=0)
+    
+    # Perform k-means clustering on player colors to identify two teams
+    color_features = np.array(list(player_avg_colors.values()))
+    
+    # Use k=2 for two teams
+    kmeans = KMeans(n_clusters=2, random_state=42)
+    team_labels = kmeans.fit_predict(color_features)
+    
+    # Create team assignments dictionary
+    team_assignments = {}
+    for i, object_id in enumerate(player_avg_colors.keys()):
+        team_assignments[object_id] = int(team_labels[i])
+    
+    # Get representative team colors
+    team_colors = [
+        tuple(np.round(kmeans.cluster_centers_[0]).astype(int)),
+        tuple(np.round(kmeans.cluster_centers_[1]).astype(int))
+    ]
+    
+    # Output team colors for debugging
+    print(f"Team 0 color (BGR): {team_colors[0]}")
+    print(f"Team 1 color (BGR): {team_colors[1]}")
+    
+    return team_assignments, team_colors
+
+def extract_jersey_region(player_mask):
+    """
+    Extract the jersey region from a player mask.
+    Focuses on the middle upper part of the player's body.
+    
+    Args:
+        player_mask: Boolean mask of player
+        
+    Returns:
+        jersey_mask: Boolean mask of just the jersey region
+    """
+    # Get bounding box of player
+    y_indices, x_indices = np.where(player_mask)
+    
+    if len(y_indices) == 0 or len(x_indices) == 0:
+        return np.zeros_like(player_mask)
+    
+    min_y, max_y = np.min(y_indices), np.max(y_indices)
+    min_x, max_x = np.min(x_indices), np.max(x_indices)
+    
+    # Calculate height of player
+    height = max_y - min_y
+    
+    # Define jersey region as middle upper part (approximately 25-60% from top)
+    jersey_top = min_y + int(height * 0.25)
+    jersey_bottom = min_y + int(height * 0.60)
+    
+    # Create jersey mask
+    jersey_mask = np.zeros_like(player_mask)
+    jersey_mask[jersey_top:jersey_bottom, min_x:max_x] = player_mask[jersey_top:jersey_bottom, min_x:max_x]
+    
+    return jersey_mask
+
+def get_team_name(team_id, team_colors):
+    """
+    Determine team name based on color analysis.
+    
+    Args:
+        team_id: Team identifier (0 or 1)
+        team_colors: List of representative team colors
+        
+    Returns:
+        team_name: String describing the team ("Blue Team", "White Team", etc.)
+    """
+    # Get the team color in BGR format
+    color = team_colors[team_id]
+    
+    # Convert to HSV for better color analysis
+    hsv_color = cv2.cvtColor(np.uint8([[color]]), cv2.COLOR_BGR2HSV)[0][0]
+    
+    # Extract hue, saturation, value
+    hue = hsv_color[0]
+    saturation = hsv_color[1]
+    value = hsv_color[2]
+    
+    # Identify colors based on HSV values
+    if saturation < 30 and value > 150:
+        return "White Team"
+    elif saturation < 50 and value < 100:
+        return "Black Team"
+    elif saturation < 50 and value < 150:
+        return "Gray Team"
+    elif 100 <= hue <= 140:
+        return "Blue Team"
+    elif 36 <= hue <= 80:
+        return "Green Team"
+    elif hue <= 20 or hue >= 160:
+        return "Red Team"
+    elif 20 < hue < 36:
+        return "Orange Team"
+    elif 80 < hue < 100:
+        return "Teal Team"
+    elif 140 < hue < 160:
+        return "Purple Team"
+    else:
+        return f"Team {team_id}"
+
+def create_visualization_with_court_and_teams(court_h5_path, player_h5_path, frame_num, shooter_id, output_path, 
+                                             is_jump_frame=False, jersey_data=None, detection_method=None,
+                                             is_three_point=None, three_point_analysis=None,
+                                             team_assignments=None, team_colors=None):
+    """
+    Extended version of create_visualization_with_court that includes team identification.
+    """
+    default_height, default_width = 1080, 1920
+    combined_canvas = np.zeros((default_height, default_width, 3), dtype=np.uint8)
+    
+    try:
+        with h5py.File(court_h5_path, 'r') as court_h5:
+            court_colors = {
+                0: (200, 0, 0),   # Blue - Boundary
+                1: (150, 0, 150),  # Purple - Key
+                2: (0, 0, 200),    # Red - Three point
+                3: (255, 255, 0)   # Yellow - Other
+            }
+            
+            court_frame_key = find_closest_court_frame(court_h5_path, frame_num)
+            
+            frames_group = court_h5
+            if 'frames' in court_h5:
+                frames_group = court_h5['frames']
+            
+            if court_frame_key is not None and court_frame_key in frames_group:
+                frame = frames_group[court_frame_key]
+                
+                for detection_key in frame.keys():
+                    detection = frame[detection_key]
+                    
+                    class_id = detection.attrs.get('class_id', detection.attrs.get('class', 0))
+                    
+                    rle_data = detection['rle'][:]
+                    mask_shape = tuple(detection['rle'].attrs['shape'])
+                    mask = rle_decode(rle_data, mask_shape)
+                    
+                    color = court_colors.get(class_id, (128, 128, 128))
+                    
+                    if mask_shape[0] != default_height or mask_shape[1] != default_width:
+                        temp_canvas = np.zeros((mask_shape[0], mask_shape[1], 3), dtype=np.uint8)
+                        temp_canvas[mask] = color
+                        
+                        temp_canvas = cv2.resize(temp_canvas, (default_width, default_height))
+                        
+                        resized_mask = np.any(temp_canvas > 0, axis=2)
+                        for c in range(3):
+                            combined_canvas[:, :, c][resized_mask] = color[c]
+                    else:
+                        combined_canvas[mask] = color
+    
+    except Exception as e:
+        print(f"Error processing court data: {e}")
+    
+    # Store the shooter's object_id and team
+    shooter_object_id = None
+    shooter_team = None
+    shooter_team_name = None
+    
+    # Store bottom 20% mask for visualization enhancement
+    bottom_mask_20_percent = None
+    bottom_area_bbox = None
+    
+    try:
+        with h5py.File(player_h5_path, 'r') as player_h5:
+            player_frame_key = f"frame_{frame_num:05d}"
+            if player_frame_key in player_h5:
+                frame_group = player_h5[player_frame_key]
+                
+                for obj_key in frame_group.keys():
+                    mask = get_mask_from_player_h5(frame_group, obj_key)
+                    if mask is None:
+                        continue
+                    
+                    # Get object_id
+                    player_obj = frame_group[obj_key]
+                    player_attrs = dict(player_obj.attrs)
+                    object_id = player_attrs.get('object_id', None)
+                    
+                    # Get player team if team_assignments is available
+                    player_team = None
+                    player_team_name = None
+                    
+                    if team_assignments and object_id is not None and object_id in team_assignments:
+                        player_team = team_assignments[object_id]
+                        
+                        # Get team name
+                        if team_colors:
+                            player_team_name = get_team_name(player_team, team_colors)
+                    
+                    # Store shooter info
+                    if obj_key == shooter_id:
+                        shooter_object_id = object_id
+                        shooter_team = player_team
+                        shooter_team_name = player_team_name
+                    
+                    # Determine coloring based on team and shooter status
+                    if shooter_id is None:
+                        # Pre-jump frames - color by team
+                        if player_team is not None and team_colors:
+                            # Use team colors
+                            color = team_colors[player_team]
+                        else:
+                            # Default white
+                            color = (255, 255, 255)
+                    else:
+                        # Highlight shooter, color others by team
+                        if obj_key == shooter_id:
+                            # Shooter is yellow at jump frame, green otherwise
+                            color = (0, 255, 255) if is_jump_frame else (0, 255, 0)
+                        elif player_team is not None and team_colors:
+                            # Use team colors for non-shooters
+                            color = team_colors[player_team]
+                        else:
+                            # Default white for non-shooters without team
+                            color = (255, 255, 255)
+                    
+                    # Apply the mask with appropriate color
+                    if mask.shape[0] != combined_canvas.shape[0] or mask.shape[1] != combined_canvas.shape[1]:
+                        temp_canvas = np.zeros((mask.shape[0], mask.shape[1], 3), dtype=np.uint8)
+                        temp_canvas[mask] = color
+                        
+                        temp_canvas = cv2.resize(temp_canvas, (combined_canvas.shape[1], combined_canvas.shape[0]))
+                        
+                        resized_mask = np.any(temp_canvas > 0, axis=2)
+                        for c in range(3):
+                            combined_canvas[:, :, c][resized_mask] = color[c]
+                    else:
+                        for c in range(3):
+                            combined_canvas[:, :, c][mask] = color[c]
+                    
+                    # Add player ID and team info
+                    obj_metadata = dict(frame_group[obj_key].attrs)
+                    text_x = int(float(obj_metadata['centroid_x']))
+                    text_y = int(float(obj_metadata['centroid_y']))
+                    
+                    # Add player ID
+                    cv2.putText(combined_canvas, obj_key, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 
+                                0.5, (0, 0, 0), 2)
+                    cv2.putText(combined_canvas, obj_key, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 
+                                0.5, (255, 255, 255), 1)
+                    
+                    # Add team info if available
+                    if player_team_name:
+                        team_text = f"({player_team_name.split()[0]})"  # Just use first word for brevity
+                        cv2.putText(combined_canvas, team_text, (text_x, text_y + 15), cv2.FONT_HERSHEY_SIMPLEX, 
+                                    0.4, (0, 0, 0), 2)
+                        cv2.putText(combined_canvas, team_text, (text_x, text_y + 15), cv2.FONT_HERSHEY_SIMPLEX, 
+                                    0.4, (255, 255, 255), 1)
+                    
+                    # Create enhanced visualization for the bottom 20% area of the shooter
+                    if obj_key == shooter_id:
+                        player_pixels = np.where(mask)
+                        if len(player_pixels[0]) > 0:
+                            # Sort y-positions in descending order (bottom to top)
+                            y_positions = player_pixels[0]
+                            x_positions = player_pixels[1]
+                            sorted_indices = np.argsort(y_positions)[::-1]
+                            
+                            # Take bottom 20% of pixels
+                            bottom_indices = sorted_indices[:max(1, int(len(sorted_indices) * 0.1))]
+                            bottom_y = y_positions[bottom_indices]
+                            bottom_x = x_positions[bottom_indices]
+                            
+                            # Create a mask for just the bottom 20%
+                            bottom_mask_20_percent = np.zeros_like(mask)
+                            bottom_mask_20_percent[bottom_y, bottom_x] = True
+                            
+                            # Calculate average position
+                            avg_y = int(np.mean(bottom_y))
+                            avg_x = int(np.mean(bottom_x))
+                            
+                            # Get bounding box of the area for visualization
+                            min_x = np.min(bottom_x)
+                            max_x = np.max(bottom_x)
+                            min_y = np.min(bottom_y)
+                            max_y = np.max(bottom_y)
+                            bottom_area_bbox = (min_x, min_y, max_x, max_y)
+                            
+                            # For jump frames, apply enhanced visualization
+                            if is_jump_frame:
+                                # Apply a more vibrant cyan color to the bottom 20% area
+                                if bottom_mask_20_percent.shape[0] != combined_canvas.shape[0] or bottom_mask_20_percent.shape[1] != combined_canvas.shape[1]:
+                                    temp_canvas = np.zeros((bottom_mask_20_percent.shape[0], bottom_mask_20_percent.shape[1], 3), dtype=np.uint8)
+                                    temp_canvas[bottom_mask_20_percent] = (0, 255, 255)  # Cyan
+                                    
+                                    temp_canvas = cv2.resize(temp_canvas, (combined_canvas.shape[1], combined_canvas.shape[0]))
+                                    
+                                    resized_mask = np.any(temp_canvas > 0, axis=2)
+                                    for c in range(3):
+                                        # Apply a semi-transparent overlay (75% opacity)
+                                        combined_canvas[:, :, c][resized_mask] = combined_canvas[:, :, c][resized_mask] * 0.25 + temp_canvas[:, :, c][resized_mask] * 0.75
+                                else:
+                                    for c in range(3):
+                                        # Apply a semi-transparent overlay (75% opacity)
+                                        combined_canvas[:, :, c][bottom_mask_20_percent] = combined_canvas[:, :, c][bottom_mask_20_percent] * 0.25 + (0 if c == 0 else 255) * 0.75
+                                
+                                # Draw a thicker red rectangle around the bottom 20% area
+                                if bottom_area_bbox:
+                                    min_x, min_y, max_x, max_y = bottom_area_bbox
+                                    cv2.rectangle(combined_canvas, (min_x, min_y), (max_x, max_y), (0, 0, 255), 3)
+                                
+                                # Add text indicating this is the jump point with larger font
+                                if avg_x and avg_y:
+                                    cv2.putText(combined_canvas, "JUMP AREA", (avg_x, max_y + 20), 
+                                              cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
+    
+    except Exception as e:
+        print(f"Error processing player data: {e}")
+    
+    # Add frame number, phase indication, and team information
+    frame_text = f"Frame: {frame_num}"
+    if is_jump_frame:
+        frame_text += " (JUMP FRAME)"
+        if detection_method:
+            frame_text += f" - Method: {detection_method}"
+    elif shooter_id is None:
+        frame_text += " (PRE-JUMP)"
+    else:
+        frame_text += " (SHOT SEQUENCE)"
+    
+    # Add jersey number if available
+    if shooter_object_id is not None and jersey_data and str(shooter_object_id) in jersey_data:
+        jersey_number = jersey_data[str(shooter_object_id)]['number']
+        frame_text += f" - Player #{jersey_number}"
+    
+    # Add team information if available
+    if shooter_team_name:
+        frame_text += f" - {shooter_team_name}"
+    
+    # Add three-point shot information if available
+    if is_three_point is not None:
+        if is_three_point:
+            frame_text += " - 3PT SHOT"
+        else:
+            frame_text += " - 2PT SHOT"
+    
+    cv2.putText(combined_canvas, frame_text, (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 
+                1.0, (255, 255, 255), 2)
+    
+    cv2.imwrite(str(output_path), combined_canvas)
+    return combined_canvas, shooter_team_name
+
+def create_jump_sequence_video_with_teams(court_h5_path, player_h5_path, jump_frame, shot_frame, shooter_id, output_path, 
+                                        fps=10, pre_jump_frames=20, jersey_data=None, detection_method=None,
+                                        team_assignments=None, team_colors=None):
+    """
+    Extended version of create_jump_sequence_video that includes team identification.
+    """
+    # Include frames before the jump for context
+    start_frame = max(1, jump_frame - pre_jump_frames)
+    
+    # Get all frames from pre-jump through shot
+    frames = list(range(start_frame, shot_frame + 1))
+    
+    # Create temporary directory for frames
+    temp_dir = Path('temp_frames')
+    temp_dir.mkdir(exist_ok=True)
+    
+    try:
+        # First check if the shot is a three-pointer
+        three_point_check = check_three_point_shot(court_h5_path, player_h5_path, jump_frame, shooter_id)
+        is_three_point, proximity_to_line, three_point_analysis = three_point_check
+        
+        # Store shooter's team name for consistent reporting
+        shooter_team_name = None
+        
+        print(f"Three-point shot analysis at jump frame {jump_frame}:")
+        print(f"  Is three-point shot: {is_three_point}")
+        print(f"  Distance to 3PT line: {proximity_to_line:.2f} pixels")
+        print(f"  Analysis details: {three_point_analysis}")
+        
+        # Generate frames
+        frame_paths = []
+        for i, frame_num in enumerate(frames):
+            is_jump_frame = (frame_num == jump_frame)
+            is_pre_jump = (frame_num < jump_frame)
+            frame_path = temp_dir / f'frame_{i:05d}.png'
+            frame_paths.append(frame_path)
+            
+            # Only highlight the shooter after the jump begins
+            current_shooter_id = None if is_pre_jump else shooter_id
+            
+            # Include detection method for visualization
+            # Also include three-point shot info if this is the jump frame
+            current_is_three_point = is_three_point if is_jump_frame else None
+            current_three_point_analysis = three_point_analysis if is_jump_frame else None
+            
+            # Create visualization with team information
+            result = create_visualization_with_court_and_teams(
+                court_h5_path, 
+                player_h5_path, 
+                frame_num, 
+                current_shooter_id, 
+                frame_path, 
+                is_jump_frame, 
+                jersey_data,
+                detection_method if is_jump_frame else None,
+                current_is_three_point,
+                current_three_point_analysis,
+                team_assignments,
+                team_colors
+            )
+            
+            # Unpack result tuple
+            if isinstance(result, tuple) and len(result) > 1:
+                _, current_team_name = result
+                # Store shooter's team name from the jump frame
+                if is_jump_frame and current_team_name:
+                    shooter_team_name = current_team_name
+        
+        # Report shooter's team
+        if shooter_team_name:
+            print(f"SHOOTER TEAM: {shooter_team_name}")
+        
+        # Check if we have any frames
+        if not frame_paths:
+            print("No frames were generated for the video.")
+            return False
+        
+        # Get frame dimensions from the first frame
+        first_frame = cv2.imread(str(frame_paths[0]))
+        if first_frame is None:
+            print(f"Could not read frame: {frame_paths[0]}")
+            return False
+            
+        height, width, _ = first_frame.shape
+        
+        # Create video writer
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        video_writer = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
+        
+        # Add frames to video
+        for frame_path in frame_paths:
+            frame = cv2.imread(str(frame_path))
+            if frame is not None:
+                video_writer.write(frame)
+        
+        video_writer.release()
+        
+        return True, shooter_team_name
+        
+    except Exception as e:
+        print(f"Error creating sequence video: {e}")
+        return False, None
+    finally:
+        # Clean up temporary files
+        if temp_dir.exists():
+            for file in temp_dir.glob('*.png'):
+                file.unlink()
+            temp_dir.rmdir()
 
 def main():
     fileName = "4thQMackay1"
     court_h5_path = f'courtTrackingOutputs/{fileName}.h5'
     player_h5_path = f'trackingOutputs/{fileName}.h5'
     shot_csv_path = f'madeShotCSV/{fileName}.csv'
-    jersey_json_path = f'jerseyNumbers/{fileName}_jersey.json'  # Updated path with _jersey
+    jersey_json_path = f'jerseyNumbers/{fileName}_jersey.json'
+    video_path = f'clips/{fileName}.mp4'
     
     # Create output directories
     output_dir = Path('madeShots')
@@ -1116,18 +1685,16 @@ def main():
     sequences_dir = Path('shotSequences')
     sequences_dir.mkdir(exist_ok=True)
     
-    # Create a new directory for detection method logs
     detection_logs_dir = Path('detectionLogs')
     detection_logs_dir.mkdir(exist_ok=True)
     
-    # Create a directory for three-point analysis
     three_point_dir = Path('threePointAnalysis')
     three_point_dir.mkdir(exist_ok=True)
     
-    # Create a log file for detection methods with 3-point information
+    # Create a log file for detection methods with 3-point information and team info
     log_file = detection_logs_dir / f'{fileName}_detection_methods.csv'
     with open(log_file, 'w') as f:
-        f.write("shot_frame,jump_frame,shooter_id,detection_method,jersey_number,is_three_point,distance_to_line\n")
+        f.write("shot_frame,jump_frame,shooter_id,detection_method,jersey_number,is_three_point,distance_to_line,team\n")
     
     # Load jersey number data
     jersey_data = None
@@ -1137,6 +1704,19 @@ def main():
         print(f"Successfully loaded jersey numbers from {jersey_json_path}")
     except Exception as e:
         print(f"Error loading jersey numbers: {e}")
+    
+    # Extract team colors and assignments
+    print("Extracting team colors from video...")
+    team_assignments, team_colors = extract_team_colors(player_h5_path, video_path)
+    
+    if team_assignments:
+        print(f"Successfully identified teams for {len(team_assignments)} players")
+        # Print team colors
+        for team_id in range(2):
+            team_name = get_team_name(team_id, team_colors)
+            print(f"Team {team_id}: {team_name} - Color (BGR): {team_colors[team_id]}")
+    else:
+        print("Failed to extract team colors. Using default colors.")
     
     # Load shot detections
     shots = load_shot_detections(shot_csv_path)
@@ -1168,6 +1748,13 @@ def main():
                     print(f"No jersey number found for object ID {object_id}")
             else:
                 print("No jersey data available or object_id not found")
+            
+            # Get shooter's team
+            shooter_team_name = None
+            if team_assignments and object_id is not None and object_id in team_assignments:
+                team_id = team_assignments[object_id]
+                shooter_team_name = get_team_name(team_id, team_colors)
+                print(f"SHOOTER TEAM: {shooter_team_name}")
         
         # Check if the shot is a three-pointer (if we have a valid jump frame)
         is_three_point = False
@@ -1186,10 +1773,10 @@ def main():
                 print(f"  Distance to 3PT line: {proximity_to_line:.2f} pixels")
                 print(f"  Analysis details: {three_point_analysis}")
                 
-                # Save a separate visualization for the three-point analysis
+                # Save a separate visualization for the three-point analysis with team info
                 three_point_viz_path = three_point_dir / f'three_point_analysis_{jump_frame:05d}.png'
                 # Create enhanced visualization showing 3-point line and player position
-                create_visualization_with_court(
+                create_visualization_with_court_and_teams(
                     court_h5_path, 
                     player_h5_path, 
                     jump_frame, 
@@ -1199,7 +1786,9 @@ def main():
                     jersey_data, 
                     detection_method,
                     is_three_point,
-                    three_point_analysis
+                    three_point_analysis,
+                    team_assignments,
+                    team_colors
                 )
             except Exception as e:
                 # If there's an error in three-point analysis, log it but continue processing
@@ -1208,11 +1797,12 @@ def main():
                 proximity_to_line = float('inf')
                 three_point_analysis = None
         
-        # Log the detection information with 3-point data
+        # Log the detection information with 3-point data and team info
         with open(log_file, 'a') as f:
             three_point_str = "Yes" if is_three_point else "No"
             distance_str = f"{proximity_to_line:.2f}" if proximity_to_line != float('inf') else "N/A"
-            f.write(f"{shot_frame},{jump_frame if jump_frame else 'None'},{shooter_id if shooter_id else 'None'},{detection_method},{jersey_number},{three_point_str},{distance_str}\n")
+            team_str = shooter_team_name if shooter_team_name else "Unknown"
+            f.write(f"{shot_frame},{jump_frame if jump_frame else 'None'},{shooter_id if shooter_id else 'None'},{detection_method},{jersey_number},{three_point_str},{distance_str},{team_str}\n")
         
         # Create a detailed log for this shot
         shot_log_file = detection_logs_dir / f'shot_{shot_frame}_details.txt'
@@ -1222,6 +1812,7 @@ def main():
             f.write(f"Jump Frame: {jump_frame if jump_frame else 'Not detected'}\n")
             f.write(f"Detection Method: {detection_method}\n")
             f.write(f"Jersey Number: {jersey_number}\n")
+            f.write(f"Team: {shooter_team_name if shooter_team_name else 'Unknown'}\n")
             f.write(f"Three-Point Shot: {three_point_str}\n")
             f.write(f"Distance to 3PT Line: {distance_str} pixels\n\n")
             
@@ -1240,10 +1831,11 @@ def main():
                 print(f"Detected jump at frame {jump_frame}, foot position: {jump_position}")
                 print(f"Detection method: {detection_method}")
                 
-                # Add detection method and 3-point info to the visualization filename
+                # Add detection method, 3-point info, and team info to the visualization filename
                 three_point_suffix = "3PT" if is_three_point else "2PT"
-                jump_output_path = jump_detection_dir / f'jump_frame_{jump_frame:05d}_{detection_method}_{three_point_suffix}.png'
-                create_visualization_with_court(
+                team_suffix = shooter_team_name.split()[0] if shooter_team_name else "UnknownTeam"
+                jump_output_path = jump_detection_dir / f'jump_frame_{jump_frame:05d}_{detection_method}_{three_point_suffix}_{team_suffix}.png'
+                create_visualization_with_court_and_teams(
                     court_h5_path, 
                     player_h5_path, 
                     jump_frame, 
@@ -1253,12 +1845,14 @@ def main():
                     jersey_data, 
                     detection_method,
                     is_three_point,
-                    three_point_analysis
+                    three_point_analysis,
+                    team_assignments,
+                    team_colors
                 )
                 
-                # Create a video sequence from 20 frames before jump to shot
-                sequence_output_path = sequences_dir / f'sequence_{jump_frame}_to_{shot_frame}_{detection_method}_{three_point_suffix}.mp4'
-                success = create_jump_sequence_video(
+                # Create a video sequence from 20 frames before jump to shot with team info
+                sequence_output_path = sequences_dir / f'sequence_{jump_frame}_to_{shot_frame}_{detection_method}_{three_point_suffix}_{team_suffix}.mp4'
+                success, final_team_name = create_jump_sequence_video_with_teams(
                     court_h5_path, 
                     player_h5_path, 
                     jump_frame, 
@@ -1268,17 +1862,21 @@ def main():
                     fps=10, 
                     pre_jump_frames=20, 
                     jersey_data=jersey_data, 
-                    detection_method=detection_method
+                    detection_method=detection_method,
+                    team_assignments=team_assignments,
+                    team_colors=team_colors
                 )
                 
                 if success:
                     print(f"Created shot sequence video: {sequence_output_path}")
+                    if final_team_name and final_team_name != shooter_team_name:
+                        print(f"Note: Team identification updated to {final_team_name}")
                 else:
                     print(f"Failed to create shot sequence video")
                     
                 # Also save the shot frame for reference
-                shot_output_path = output_dir / f'made_shot_{shot_frame:05d}_{three_point_suffix}.png'
-                create_visualization_with_court(
+                shot_output_path = output_dir / f'made_shot_{shot_frame:05d}_{three_point_suffix}_{team_suffix}.png'
+                create_visualization_with_court_and_teams(
                     court_h5_path, 
                     player_h5_path, 
                     shot_frame, 
@@ -1288,7 +1886,9 @@ def main():
                     jersey_data,
                     None,
                     is_three_point,
-                    three_point_analysis
+                    three_point_analysis,
+                    team_assignments,
+                    team_colors
                 )
                 
             else:
@@ -1296,11 +1896,37 @@ def main():
                 # Save all tracked frames for debugging
                 for frame_idx in all_frames:
                     frame_output_path = jump_detection_dir / f'tracked_frame_{frame_idx:05d}.png'
-                    create_visualization_with_court(court_h5_path, player_h5_path, frame_idx, shooter_id, frame_output_path, jersey_data=jersey_data)
+                    create_visualization_with_court_and_teams(
+                        court_h5_path, 
+                        player_h5_path, 
+                        frame_idx, 
+                        shooter_id, 
+                        frame_output_path, 
+                        False,
+                        jersey_data,
+                        None,
+                        None,
+                        None,
+                        team_assignments,
+                        team_colors
+                    )
         else:
             print(f"Could not find shooter for shot at frame {shot_frame}")
             output_path = output_dir / f'shot_no_shooter_{shot_frame:05d}.png'
-            create_visualization_with_court(court_h5_path, player_h5_path, shot_frame, None, output_path, jersey_data=jersey_data)
+            create_visualization_with_court_and_teams(
+                court_h5_path, 
+                player_h5_path, 
+                shot_frame, 
+                None, 
+                output_path, 
+                False,
+                jersey_data,
+                None,
+                None,
+                None,
+                team_assignments,
+                team_colors
+            )
 
 if __name__ == "__main__":
-    main() 
+    main()
