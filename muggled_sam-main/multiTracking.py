@@ -14,7 +14,7 @@ import json
 MAX_FRAMES_TO_CHECK = 400
 CONFIDENCE_THRESHOLD = 0.6
 LOST_FRAMES_THRESHOLD = 10
-BALL_CONFIDENCE_THRESHOLD = 0.45
+BALL_CONFIDENCE_THRESHOLD = 0.40  # Still using for the specialized model
 PLAYER_CONFIDENCE_THRESHOLD = 0.65
 CENTROID_DISTANCE_THRESHOLD = 30  # Maximum distance in pixels between centroids
 MASK_IOU_THRESHOLD = 0.5  # Intersection over Union threshold for mask overlap
@@ -38,7 +38,30 @@ class YOLODetectionStore:
             return [], None, None
         dets = self.detections[frame_idx]
         return dets['players'], dets['ball'], dets['rim']
+
+    # Add a method to update ball detections
+    def update_ball_detection(self, frame_idx, ball):
+        if frame_idx in self.detections:
+            self.detections[frame_idx]['ball'] = ball
+        else:
+            self.detections[frame_idx] = {
+                'players': [],
+                'ball': ball,
+                'rim': None
+            }
+
+class BallDetectionStore:
+    def __init__(self):
+        self.detections = {}  # frame_idx -> ball detection
+        
+    def add_ball_detection(self, frame_idx, ball):
+        self.detections[frame_idx] = ball
     
+    def get_ball_detection(self, frame_idx):
+        if frame_idx not in self.detections:
+            return None
+        return self.detections[frame_idx]
+
 def find_connected_components(mask):
     """Find connected components in a binary mask"""
     num_labels, labels = cv2.connectedComponents(mask.astype(np.uint8))
@@ -234,13 +257,14 @@ def log_object_tracking(trackers, frame_idx, h5_file):
                     obj_dataset.attrs['centroid_x'] = tracker.last_centroid[0]
                     obj_dataset.attrs['centroid_y'] = tracker.last_centroid[1]
 
-def preprocess_video_with_yolo(video_path, yolo_model, total_frames):
+def preprocess_video_with_yolo(video_path, yolo_model, ball_yolo_model, total_frames):
     """Batch process entire video with YOLO"""
     print("Pre-processing video with YOLO...")
     detection_store = YOLODetectionStore()
+    ball_detection_store = BallDetectionStore()
     vcap = cv2.VideoCapture(video_path)
     
-    # Process in batches of 32 frames (or adjust based on GPU memory)
+    # Process in batches of frames
     batch_size = 4
     frames = []
     frame_indices = []
@@ -258,15 +282,20 @@ def preprocess_video_with_yolo(video_path, yolo_model, total_frames):
         
         # Process batch when full or at end
         if len(frames) == batch_size or frame_idx == total_frames - 1:
+            # Process with main YOLO model for players and rim
             results = yolo_model(frames, verbose=False)
             
+            # Process with specialized ball YOLO model
+            ball_results = ball_yolo_model(frames, verbose=False)
+            
             # Process each frame's results
-            for batch_idx, result in enumerate(results):
+            for batch_idx, (result, ball_result) in enumerate(zip(results, ball_results)):
                 curr_frame_idx = frame_indices[batch_idx]
                 players = []
-                ball = None
                 rim = None
+                ball = None
                 
+                # Process main YOLO results (players and rim only)
                 for box in result.boxes:
                     class_name = result.names[box.cls[0].item()].lower()
                     x, y, w, h = box.xywh[0].tolist()
@@ -291,11 +320,40 @@ def preprocess_video_with_yolo(video_path, yolo_model, total_frames):
                     
                     if class_name == 'player' and confidence > PLAYER_CONFIDENCE_THRESHOLD:
                         players.append(detection_data)
-                    elif class_name == 'basketball' and confidence > BALL_CONFIDENCE_THRESHOLD:
-                        ball = detection_data
                     elif class_name == 'rim' and confidence > RIM_CONFIDENCE_THRESHOLD:
                         rim = detection_data
+                    # Ignore ball detections from main model
                 
+                # Process specialized ball YOLO results
+                for box in ball_result.boxes:
+                    class_name = ball_result.names[box.cls[0].item()].lower()
+                    if class_name == 'ball':
+                        x, y, w, h = box.xywh[0].tolist()
+                        confidence = box.conf[0].item()
+                        
+                        # Only process if above threshold
+                        if confidence > BALL_CONFIDENCE_THRESHOLD:
+                            # Calculate normalized coordinates
+                            norm_x = x / frame.shape[1]
+                            norm_y = y / frame.shape[0]
+                            norm_x1 = (x - w/2) / frame.shape[1]
+                            norm_y1 = (y - h/2) / frame.shape[0]
+                            norm_x2 = (x + w/2) / frame.shape[1]
+                            norm_y2 = (y + h/2) / frame.shape[0]
+                            
+                            ball = {
+                                'confidence': confidence,
+                                'box_tlbr_norm_list': [[(norm_x1, norm_y1), (norm_x2, norm_y2)]],
+                                'fg_xy_norm_list': [(norm_x, norm_y)],
+                                'bg_xy_norm_list': [],
+                                'original_box': (int(x - w/2), int(y - h/2), int(w), int(h)),
+                                'centroid': (x, y)
+                            }
+                            # Store in specialized ball detection store
+                            ball_detection_store.add_ball_detection(curr_frame_idx, ball)
+                            break  # Take the first high-confidence ball detection
+                
+                # Store in main detection store (with ball from specialized model)
                 detection_store.add_frame_detections(curr_frame_idx, players, ball, rim)
             
             # Clear batch
@@ -303,7 +361,7 @@ def preprocess_video_with_yolo(video_path, yolo_model, total_frames):
             frame_indices = []
     
     vcap.release()
-    return detection_store
+    return detection_store, ball_detection_store
 
 
 def calculate_mask_iou(mask1, mask2):
@@ -510,6 +568,7 @@ def main():
     video_path = "../TestClip2.mp4"
     model_path = "model_weights/large_custom_sam2.pt"
     yolo_model_path = "model_weights/v11.pt"
+    ball_yolo_model_path = "model_weights/BestBallYolo.pt"  # New specialized ball model
     unique_id_start = 0  # Initialize here, before config handling
 
     # Parse command line arguments
@@ -538,10 +597,12 @@ def main():
             output_labels = config.get("output_labels", output_labels)
             tracking_h5_path = config.get("tracking_h5_path", tracking_h5_path)
             unique_id_start = config.get("unique_id_start", unique_id_start)
+            # Could also add ball_yolo_model_path to config if needed
     
     # Load models
     print("Loading models...")
     yolo_model = YOLO(yolo_model_path)
+    ball_yolo_model = YOLO(ball_yolo_model_path)  # Load specialized ball model
     model_config_dict, sammodel = make_samv2_from_original_state_dict(model_path)
     sammodel.to(device=device, dtype=dtype)
     
@@ -553,8 +614,13 @@ def main():
     total_frames = int(vcap.get(cv2.CAP_PROP_FRAME_COUNT))
     vcap.release()
     
-    # Pre-process entire video with YOLO
-    detection_store = preprocess_video_with_yolo(video_path, yolo_model, total_frames)
+    # Pre-process entire video with YOLO (now using both models)
+    detection_store, _ = preprocess_video_with_yolo(
+        video_path, 
+        yolo_model, 
+        ball_yolo_model,  # Pass specialized ball model
+        total_frames
+    )
     
     # Find initialization frame using pre-computed detections
     init_frame_idx, player_points, ball_point = find_initialization_frame(detection_store)
