@@ -202,7 +202,7 @@ class ObjectTracker:
         self.frames_without_detection += 1
         
         # Check if we've reached the threshold of 8 frames without detection
-        if self.frames_without_detection >= 12:
+        if self.frames_without_detection >= 100:
             print(f"Deactivating {self.obj_key} due to {self.frames_without_detection} frames without YOLO detection above {self.yolo_detection_threshold*100}% confidence")
             self.is_active = False
             return False
@@ -217,22 +217,52 @@ class ReintroductionTracker:
         self.consecutive_detections = []
         self.required_consecutive_frames = 2
         self.confidence_threshold = confidence_threshold
+        # Add tracking of frame numbers for debugging
+        self.detection_frames = []
 
-    def add_detection(self, detection):
+    def add_detection(self, detection, frame_idx):
+        # Store both detection and frame number
         self.consecutive_detections.append(detection)
+        self.detection_frames.append(frame_idx)
+        
+        # Print detailed info about the detection
+        if detection is None:
+            print(f"[BALL DEBUG] Frame {frame_idx}: Added NULL detection to reintroduction queue")
+        else:
+            conf = detection.get('confidence', 'unknown')
+            centroid = detection.get('centroid', 'unknown')
+            print(f"[BALL DEBUG] Frame {frame_idx}: Added detection with confidence {conf:.4f} at {centroid}")
+        
+        # Keep only most recent N frames
         if len(self.consecutive_detections) > self.required_consecutive_frames:
             self.consecutive_detections.pop(0)
-
-    def should_reintroduce(self):
-        if len(self.consecutive_detections) < self.required_consecutive_frames:
-            return False, None
+            self.detection_frames.pop(0)
             
-        valid_detections = [d for d in self.consecutive_detections 
-                          if d is not None and d['confidence'] > self.confidence_threshold]
+        # Print current state of consecutive detections
+        print(f"[BALL DEBUG] Frame {frame_idx}: Current reintroduction queue has {len(self.consecutive_detections)}/{self.required_consecutive_frames} detections")
+
+    def should_reintroduce(self, frame_idx):
+        if len(self.consecutive_detections) < self.required_consecutive_frames:
+            print(f"[BALL DEBUG] Frame {frame_idx}: Not enough consecutive detections ({len(self.consecutive_detections)}/{self.required_consecutive_frames})")
+            return False, None
+        
+        valid_detections = []
+        for i, (det, det_frame) in enumerate(zip(self.consecutive_detections, self.detection_frames)):
+            if det is not None and det.get('confidence', 0) > self.confidence_threshold:
+                valid_detections.append((det, det_frame))
+                print(f"[BALL DEBUG] Frame {frame_idx}: Valid detection in frame {det_frame} with confidence {det.get('confidence', 0):.4f}")
+            elif det is None:
+                print(f"[BALL DEBUG] Frame {frame_idx}: Invalid NULL detection in frame {det_frame}")
+            else:
+                print(f"[BALL DEBUG] Frame {frame_idx}: Low confidence detection in frame {det_frame}: {det.get('confidence', 0):.4f} < {self.confidence_threshold}")
         
         if len(valid_detections) == self.required_consecutive_frames:
-            return True, valid_detections[-1]
+            print(f"[BALL DEBUG] Frame {frame_idx}: REINTRODUCTION APPROVED - {len(valid_detections)} consecutive valid detections")
+            return True, valid_detections[-1][0]  # Return most recent valid detection
+        
+        print(f"[BALL DEBUG] Frame {frame_idx}: Not enough valid detections ({len(valid_detections)}/{self.required_consecutive_frames})")
         return False, None
+
 
 def log_object_tracking(trackers, frame_idx, h5_file):
     """Log tracking data in an efficient HDF5 format"""
@@ -628,11 +658,9 @@ def main():
     
     # Create prompts from detections
     unique_id_counter = unique_id_start
-    prompts_per_frame_index = {
-        init_frame_idx: {
-            f"player_{unique_id_counter+i}": point_data
-            for i, point_data in enumerate(player_points)
-        }
+    prompts_per_frame_index[init_frame_idx] = {
+        f"player_{i}": point_data
+        for i, point_data in enumerate(player_points[:10])  # Limit to max 10 players (0-9)
     }
     prompts_per_frame_index[init_frame_idx]["ball"] = ball_point
     
@@ -703,6 +731,13 @@ def main():
                             dist = calculate_centroid_distance(tracker.last_centroid, detected_ball['centroid'])
                             if dist < CENTROID_DISTANCE_THRESHOLD and detected_ball['confidence'] > tracker.yolo_detection_threshold:
                                 high_confidence_detection = True
+                                print(f"[BALL DEBUG] Frame {frame_idx}: Matched YOLO ball detection with current tracker (distance: {dist:.2f}px)")
+                            else:
+                                print(f"[BALL DEBUG] Frame {frame_idx}: YOLO ball detection does NOT match current tracker")
+                                if dist >= CENTROID_DISTANCE_THRESHOLD:
+                                    print(f"[BALL DEBUG] Frame {frame_idx}: Distance too large: {dist:.2f}px >= {CENTROID_DISTANCE_THRESHOLD}px")
+                                if detected_ball['confidence'] <= tracker.yolo_detection_threshold:
+                                    print(f"[BALL DEBUG] Frame {frame_idx}: Confidence too low: {detected_ball['confidence']:.4f} <= {tracker.yolo_detection_threshold}")
                     
                     # For rim
                     elif obj_key == "rim" and detected_rim:
@@ -713,14 +748,18 @@ def main():
                     
                     # Update the no-detection counter or reset it
                     if high_confidence_detection:
+                        if obj_key == "ball":
+                            print(f"[BALL DEBUG] Frame {frame_idx}: Ball has high-confidence YOLO match, resetting no-detection counter")
                         tracker.reset_no_detection()
                     else:
+                        if obj_key == "ball":
+                            print(f"[BALL DEBUG] Frame {frame_idx}: Ball has NO high-confidence YOLO match, incrementing no-detection counter")
                         tracker.increment_no_detection()
                 
                 # Handle rim detection and tracking
                 if "rim" not in trackers or not trackers["rim"].is_active:
-                    rim_reintroduction.add_detection(detected_rim)
-                    should_reintroduce, rim_data = rim_reintroduction.should_reintroduce()
+                    rim_reintroduction.add_detection(detected_rim, frame_idx)
+                    should_reintroduce, rim_data = rim_reintroduction.should_reintroduce(frame_idx)
                     
                     if should_reintroduce:
                         print(f"Introducing rim tracking at frame {frame_idx}")
@@ -732,17 +771,41 @@ def main():
                 
                 # Check for lost ball and handle reintroduction
                 if "ball" not in trackers or not trackers["ball"].is_active:
-                    ball_reintroduction.add_detection(detected_ball)
-                    should_reintroduce, ball_data = ball_reintroduction.should_reintroduce()
+                    # Print reason for missing ball if it was previously active
+                    if "ball" in trackers:
+                        print(f"[BALL DEBUG] Frame {frame_idx}: Ball tracking is INACTIVE")
+                        # Print more details if ball was deactivated recently
+                        if trackers["ball"].consecutive_low_scores >= LOST_FRAMES_THRESHOLD:
+                            print(f"[BALL DEBUG] Frame {frame_idx}: Ball was deactivated due to {trackers['ball'].consecutive_low_scores} consecutive low scores")
+                        if hasattr(trackers["ball"], 'invalid_ball_mask_count') and trackers["ball"].invalid_ball_mask_count > 2:
+                            print(f"[BALL DEBUG] Frame {frame_idx}: Ball was deactivated due to invalid mask dimensions")
+                        if trackers["ball"].frames_without_detection >= 12:
+                            print(f"[BALL DEBUG] Frame {frame_idx}: Ball was deactivated due to {trackers['ball'].frames_without_detection} frames without YOLO detection")
+                    else:
+                        print(f"[BALL DEBUG] Frame {frame_idx}: No ball tracker exists yet")
+                    
+                    # Log detailed information about the current ball detection
+                    if detected_ball:
+                        print(f"[BALL DEBUG] Frame {frame_idx}: YOLO detected a ball with confidence {detected_ball['confidence']:.4f} at {detected_ball['centroid']}")
+                    else:
+                        print(f"[BALL DEBUG] Frame {frame_idx}: YOLO did NOT detect any ball in this frame")
+                    
+                    # Add to reintroduction tracker with modified function signature
+                    ball_reintroduction.add_detection(detected_ball, frame_idx)
+                    
+                    # Check if reintroduction conditions are met
+                    should_reintroduce, ball_data = ball_reintroduction.should_reintroduce(frame_idx)
                     
                     if should_reintroduce:
-                        print(f"Reintroducing ball at frame {frame_idx}")
+                        print(f"[BALL DEBUG] Frame {frame_idx}: REINTRODUCING BALL with confidence {ball_data['confidence']:.4f} at {ball_data['centroid']}")
                         trackers["ball"] = ObjectTracker("ball", unique_id_counter)
                         unique_id_counter += 1
                         if frame_idx not in prompts_per_frame_index:
                             prompts_per_frame_index[frame_idx] = {}
                         prompts_per_frame_index[frame_idx]["ball"] = ball_data
                         ball_reintroduction = ReintroductionTracker(BALL_CONFIDENCE_THRESHOLD)
+                    else:
+                        print(f"[BALL DEBUG] Frame {frame_idx}: Ball reintroduction conditions NOT met")
                 
                 # Handle player reintroductions
                 missing_slots = get_missing_player_slots(trackers)
@@ -799,9 +862,16 @@ def main():
                     )
                     
                     # Update tracker status based on score
-                    tracker.update_score(obj_score.item())
+                    score_value = obj_score.item()
+                    if obj_key == "ball":
+                        print(f"[BALL DEBUG] Frame {frame_idx}: Ball SAM tracking score: {score_value:.4f}")
+                    
+                    tracker.update_score(score_value)
                     if not tracker.is_active:
-                        print(f"Removing {obj_key} due to consecutive low scores")
+                        if obj_key == "ball":
+                            print(f"[BALL DEBUG] Frame {frame_idx}: Removing ball due to consecutive low scores")
+                        else:
+                            print(f"Removing {obj_key} due to consecutive low scores")
                         continue
                     
                     # Create mask for movement validation
@@ -814,8 +884,14 @@ def main():
                     obj_mask_binary = (obj_mask > 0.0).cpu().numpy().squeeze()
                     
                     # Validate movement first - if invalid, skip all further processing
-                    if not tracker.update_mask_and_centroid(obj_mask_binary):
+                    mask_valid = tracker.update_mask_and_centroid(obj_mask_binary)
+                    if not mask_valid:
+                        if obj_key == "ball":
+                            print(f"[BALL DEBUG] Frame {frame_idx}: Ball mask validation FAILED")
                         continue
+                    
+                    if obj_key == "ball":
+                        print(f"[BALL DEBUG] Frame {frame_idx}: Ball mask validation PASSED")
                     
                     # Only store memory and continue processing if movement was valid
                     obj_memory.store_result(frame_idx, mem_enc, obj_ptr)
@@ -840,6 +916,22 @@ def main():
                                 trackers[obj_key].is_active = False
                                 if obj_key in active_objects:
                                     active_objects.remove(obj_key)
+                
+                # After tracking objects, add debug information about ball masks if it exists
+                if "ball" in trackers and trackers["ball"].is_active:
+                    tracker = trackers["ball"]
+                    if tracker.last_mask is not None:
+                        y_indices, x_indices = np.where(tracker.last_mask)
+                        if len(x_indices) > 0:
+                            height = max(y_indices) - min(y_indices)
+                            width = max(x_indices) - min(x_indices)
+                            frame_height = tracker.last_mask.shape[0]
+                            
+                            aspect_ratio = max(width / height if height != 0 else float('inf'),
+                                            height / width if width != 0 else float('inf'))
+                            relative_height = height / frame_height
+                            
+                            print(f"[BALL DEBUG] Frame {frame_idx}: Current ball mask - width={width}, height={height}, aspect_ratio={aspect_ratio:.2f}, rel_height={relative_height:.5f}")
                 
                 # Log object tracking information
                 log_object_tracking(trackers, frame_idx, h5_file)
