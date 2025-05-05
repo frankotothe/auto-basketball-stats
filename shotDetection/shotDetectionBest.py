@@ -305,7 +305,7 @@ def find_sequence_starts(shots):
     while i < len(shots):
         current_frame = int(shots[i]['frame'])
         
-        if shots[i]['confidence'] >= 0.45:
+        if shots[i]['confidence'] >= 0.5:
             sequence_starts.append(current_frame)
             while i < len(shots) and shots[i]['frame'] - current_frame <= 5:
                 i += 1
@@ -2016,12 +2016,9 @@ def main():
     expected_team_looking_left = "Gray"  
     expected_team_looking_right = "Blue"
     
-    # Create output directories
+    # Create output directories (removed jumpDetection directory)
     output_dir = Path('madeShots')
     output_dir.mkdir(exist_ok=True)
-    
-    jump_detection_dir = Path('jumpDetection')
-    jump_detection_dir.mkdir(exist_ok=True)
     
     sequences_dir = Path('shotSequences')
     sequences_dir.mkdir(exist_ok=True)
@@ -2048,6 +2045,21 @@ def main():
     log_file = detection_logs_dir / f'{fileName}_detection_methods.csv'
     with open(log_file, 'w') as f:
         f.write("shot_frame,jump_frame,shooter_id,detection_method,jersey_number,is_three_point,distance_to_line,team,is_valid_shot,validation_reason,is_team_match,court_orientation,shooter_frame,shooter_detection_method,shooter_ball_distance\n")
+    
+    # Create a scoring tally to track points
+    scoring_tally = {
+        "home": {
+            "2PT": 0,
+            "3PT": 0,
+            "total": 0
+        },
+        "away": {
+            "2PT": 0,
+            "3PT": 0,
+            "total": 0
+        },
+        "players": {}  # Will store by player jersey number and team
+    }
     
     # Load jersey number data
     jersey_data = None
@@ -2141,45 +2153,6 @@ def main():
             if jump_frame is not None:
                 team_viz_path = team_verification_dir / f'team_verification_{jump_frame:05d}_{team_name}_{court_orientation}_match-{is_team_match}.png'
                 create_visualization_with_court(court_h5_path, player_h5_path, jump_frame, shooter_id, team_viz_path, True, jersey_data, None, None, None, None, None, None, ball_data)
-            
-            # Create a visualization for the shooter at the identified frame
-            if shooter_id is not None and shooter_frame is not None:
-                shooter_visualization_path = jump_detection_dir / f'shooter_identified_{shooter_frame}_{shooter_detection_method}.png'
-                create_visualization_with_court(
-                    court_h5_path, 
-                    player_h5_path, 
-                    shooter_frame, 
-                    shooter_id, 
-                    shooter_visualization_path, 
-                    False, 
-                    jersey_data,
-                    None,
-                    None,
-                    None,
-                    shooter_frame,
-                    shooter_detection_method,
-                    shooter_ball_distance,
-                    ball_data  # Pass ball data to the function
-                )
-                
-                # Also create a visualization with the frame name in the title to make it clearer
-                shooter_viz_with_frame = jump_detection_dir / f'frame_{shooter_frame}_shooter_{shooter_id}_{shooter_detection_method}_{shooter_ball_distance:.2f}px.png'
-                create_visualization_with_court(
-                    court_h5_path, 
-                    player_h5_path, 
-                    shooter_frame, 
-                    shooter_id, 
-                    shooter_viz_with_frame, 
-                    False, 
-                    jersey_data,
-                    None,
-                    None,
-                    None,
-                    shooter_frame,
-                    shooter_detection_method,
-                    shooter_ball_distance,
-                    ball_data  # Pass ball data to the function
-                )
         
         # Check if the shot is a three-pointer (if we have a valid jump frame)
         is_three_point = False
@@ -2228,6 +2201,36 @@ def main():
                 is_three_point = False
                 proximity_to_line = float('inf')
                 three_point_analysis = None
+        
+        # Determine team_type (home or away)
+        team_type = "unknown"
+        if court_orientation == "looking_left":
+            team_type = "home"
+        elif court_orientation == "looking_right":
+            team_type = "away"
+        
+        # Update scoring tally if the shot is valid
+        if is_valid_shot and shooter_id is not None:
+            points = 3 if is_three_point else 2
+            point_type = "3PT" if is_three_point else "2PT"
+            
+            # Update team total
+            if team_type in scoring_tally:
+                scoring_tally[team_type][point_type] += 1
+                scoring_tally[team_type]["total"] += points
+            
+            # Update player total
+            player_key = f"{team_type}_{jersey_number}" if jersey_number != "unknown" else f"{team_type}_undetected"
+            
+            if player_key not in scoring_tally["players"]:
+                scoring_tally["players"][player_key] = {
+                    "2PT": 0,
+                    "3PT": 0,
+                    "total": 0
+                }
+            
+            scoring_tally["players"][player_key][point_type] += 1
+            scoring_tally["players"][player_key]["total"] += points
         
         # Log the detection information with 3-point data, team info, and shot validation
         with open(log_file, 'a') as f:
@@ -2290,39 +2293,18 @@ def main():
         # Determine target directory based on shot validity
         target_dir = sequences_dir if is_valid_shot else invalid_sequences_dir
         
-        # For naming files
-        three_point_suffix = "3PT" if is_three_point else "2PT"
-        team_suffix = team_name.split()[0] if team_name != "Unknown Team" else "Unknown"
-        match_suffix = "TeamMatch" if is_team_match else "TeamMismatch"
+        # For naming files - simplified as requested
+        point_type = "3PT" if is_three_point else "2PT"
         
         if shooter_id is not None:
             if jump_frame is not None:
                 print(f"Detected jump at frame {jump_frame}, foot position: {jump_position}")
                 print(f"Detection method: {detection_method}")
                 
-                # Create visualization for jump frame
-                jump_output_path = jump_detection_dir / f'jump_frame_{jump_frame:05d}_{detection_method}_{three_point_suffix}_{team_suffix}_{match_suffix}_{validity_suffix}.png'
-                create_visualization_with_court(
-                    court_h5_path, 
-                    player_h5_path, 
-                    jump_frame, 
-                    shooter_id, 
-                    jump_output_path, 
-                    True, 
-                    jersey_data, 
-                    detection_method,
-                    is_three_point,
-                    three_point_analysis,
-                    shooter_frame,
-                    shooter_detection_method,
-                    shooter_ball_distance,
-                    ball_data  # Pass ball data to the function
-                )
+                # Create sequence video with simplified naming
+                sequence_output_path = target_dir / f'{jump_frame}_to_{shot_frame}_{team_type}_{point_type}.mp4'
                 
-                # Create sequence video
-                sequence_output_path = target_dir / f'sequence_{jump_frame}_to_{shot_frame}_{detection_method}_{three_point_suffix}_{team_suffix}_{match_suffix}_{validity_suffix}.mp4'
-                
-                success, team_type = create_jump_sequence_video(
+                success, detected_team_type = create_jump_sequence_video(
                     court_h5_path, 
                     player_h5_path, 
                     jump_frame, 
@@ -2341,7 +2323,7 @@ def main():
                 
                 if success:
                     print(f"Created shot sequence video: {sequence_output_path}")
-                    print(f"Team type from sequence: {team_type}")
+                    print(f"Team type from sequence: {detected_team_type}")
                 else:
                     print(f"Failed to create shot sequence video")
                 
@@ -2352,10 +2334,10 @@ def main():
                 # Use max lookback frames to create a sequence
                 estimated_jump_frame = max(1, shot_frame - 30)  # Assume jump happened ~30 frames before shot
                 
-                # Create sequence video with estimated jump frame
-                sequence_output_path = target_dir / f'sequence_est{estimated_jump_frame}_to_{shot_frame}_{detection_method}_{team_suffix}_{match_suffix}_{validity_suffix}.mp4'
+                # Create sequence video with estimated jump frame and simplified naming
+                sequence_output_path = target_dir / f'{estimated_jump_frame}_to_{shot_frame}_{team_type}_{point_type}.mp4'
                 
-                success, team_type = create_jump_sequence_video(
+                success, detected_team_type = create_jump_sequence_video(
                     court_h5_path, 
                     player_h5_path, 
                     estimated_jump_frame, 
@@ -2374,15 +2356,9 @@ def main():
                 
                 if success:
                     print(f"Created shot sequence video (with estimated jump): {sequence_output_path}")
-                    print(f"Team type from sequence: {team_type}")
+                    print(f"Team type from sequence: {detected_team_type}")
                 else:
                     print(f"Failed to create shot sequence video")
-                
-                # Save all tracked frames for debugging
-                for frame_idx in all_frames:
-                    frame_output_path = jump_detection_dir / f'tracked_frame_{frame_idx:05d}_{validity_suffix}.png'
-                    create_visualization_with_court(court_h5_path, player_h5_path, frame_idx, shooter_id, frame_output_path, 
-                                                  False, jersey_data, None, None, None, None, None, None, ball_data)
         else:
             print(f"Could not find shooter for shot at frame {shot_frame}")
             
@@ -2391,7 +2367,7 @@ def main():
             estimated_start_frame = max(1, shot_frame - 40)  # Look back 40 frames
             
             # Create a sequence video for shots with no detected shooter
-            sequence_output_path = target_dir / f'sequence_noShooter_{estimated_start_frame}_to_{shot_frame}_{validity_suffix}.mp4'
+            sequence_output_path = target_dir / f'{estimated_start_frame}_to_{shot_frame}_unknown_unknown.mp4'
             
             # Create a video with no specific shooter highlighted
             success, _ = create_jump_sequence_video(
@@ -2420,6 +2396,32 @@ def main():
             output_path = target_dir / f'shot_no_shooter_{shot_frame:05d}_{validity_suffix}.png'
             create_visualization_with_court(court_h5_path, player_h5_path, shot_frame, None, output_path, 
                                           False, jersey_data, None, None, None, None, None, None, ball_data)
+    
+    # Print final scoring tally
+    print("\n\n===== FINAL SCORING TALLY =====")
+    print("\nTEAM SCORES:")
+    print(f"HOME: {scoring_tally['home']['total']} points ({scoring_tally['home']['2PT']} × 2PT, {scoring_tally['home']['3PT']} × 3PT)")
+    print(f"AWAY: {scoring_tally['away']['total']} points ({scoring_tally['away']['2PT']} × 2PT, {scoring_tally['away']['3PT']} × 3PT)")
+    
+    print("\nPLAYER SCORES:")
+    for player_key, stats in scoring_tally["players"].items():
+        team, identifier = player_key.split('_', 1)
+        player_desc = f"#{identifier}" if identifier != "undetected" else "Undetected Player"
+        print(f"{team.upper()} {player_desc}: {stats['total']} points ({stats['2PT']} × 2PT, {stats['3PT']} × 3PT)")
+    
+    # Write tally to file
+    tally_file = Path(f'scoring_tally_{fileName}.txt')
+    with open(tally_file, 'w') as f:
+        f.write("===== FINAL SCORING TALLY =====\n\n")
+        f.write("TEAM SCORES:\n")
+        f.write(f"HOME: {scoring_tally['home']['total']} points ({scoring_tally['home']['2PT']} × 2PT, {scoring_tally['home']['3PT']} × 3PT)\n")
+        f.write(f"AWAY: {scoring_tally['away']['total']} points ({scoring_tally['away']['2PT']} × 2PT, {scoring_tally['away']['3PT']} × 3PT)\n\n")
+        
+        f.write("PLAYER SCORES:\n")
+        for player_key, stats in scoring_tally["players"].items():
+            team, identifier = player_key.split('_', 1)
+            player_desc = f"#{identifier}" if identifier != "undetected" else "Undetected Player"
+            f.write(f"{team.upper()} {player_desc}: {stats['total']} points ({stats['2PT']} × 2PT, {stats['3PT']} × 3PT)\n")
 
 if __name__ == "__main__":
     main()
